@@ -315,6 +315,8 @@ plt.xlabel("T rounds")
 plt.ylabel("g(T)")
 plt.legend()
 plt.tight_layout()
+plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
+plt.close()
 
 # 3) Evaluate across revamped 4 streams
 rows, cols = 2, 2
@@ -339,4 +341,5 @@ for j in range(len(CASES), rows * cols):
 
 fig.suptitle("Four algorithms across four streams (comparator = SVM hindsight)", fontsize=14)
 fig.tight_layout()
-plt.show()
+plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
+plt.close()
