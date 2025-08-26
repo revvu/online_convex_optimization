@@ -143,17 +143,11 @@ def simulate_empirical_g_SMART(z, y, u_comp, theta_emp, *, R=1.0, eta0=math.sqrt
 # Soft-margin SVM (Pegasos) for hindsight comparator
 # ==============================================================
 
-def pegasos_svm(X: np.ndarray,
-                y: np.ndarray,
-                *,
-                lam: float,
-                iters: int | None = None,
-                batch_size: int | None = None,
-                R: float = 1.0,
-                seed: int = 0) -> np.ndarray:
+def pegasos_svm(X, y, *, lam, iters=None, batch_size=None, R=1.0, seed=0, epochs=100):
     N, d = X.shape
-    iters = iters or (10 * N)
     batch_size = batch_size or min(100, N)
+    if iters is None:
+        iters = max(1, int(epochs * N / batch_size))  # ~epochs passes
     rng = np.random.default_rng(seed)
     w = np.zeros(d)
 
@@ -218,36 +212,24 @@ def orthogonal_hard_sequence(T: int, R: float = 1.0):
     u = np.ones(T) / math.sqrt(T)
     return z, y, u
 
-def phase_change_sequence(T: int, d: int = 5, R: float = 1.0, frac_easy: float = 0.6, p_easy: float = 0.0):
-    """
-    First k rounds: i.i.d. (optionally noisy). Remaining: adversarial label flips with constant feature.
-    """
-    k = max(1, int(T * frac_easy))
-    z1, y1, u = random_iid_sequence(k, d=d, R=R)
-    if p_easy > 0:
-        flips = np.random.rand(k) < p_easy
-        y1[flips] *= -1
-    z2 = np.zeros((T - k, d)); z2[:, 0] = R
-    y2 = np.array([1.0 if t % 2 else -1.0 for t in range(1, T - k + 1)], dtype=float)
-    z = np.vstack([z1, z2]); y = np.concatenate([y1, y2])
-    return z, y, u
+
 
 # --- UPDATED CASE SET ---
 CASES = {
     "Random i.i.d. (separable)":        random_iid_sequence,
-    "Noisy i.i.d. (Massart 30%)":       partial(noisy_iid_sequence, p=0.30),
-    "Phase change: sep→flip (60/40)":   partial(phase_change_sequence, frac_easy=0.6),
+    "Noisy i.i.d. (Massart 10%)":       partial(noisy_iid_sequence, p=0.10),
+    "Noisy i.i.d. (Massart 40%)":       partial(noisy_iid_sequence, p=0.40),
     "Label flips (worst-case)":         flip_sequence,
-    "Orthogonal (hard)":                orthogonal_hard_sequence,
+    # "Orthogonal (hard)":                orthogonal_hard_sequence,
 }
 
 # Optional: case-specific averaging to reduce variance where needed
 RUNS_BY_TITLE = {
     "Random i.i.d. (separable)":       30,
-    "Noisy i.i.d. (Massart 30%)":      30,
-    "Phase change: sep→flip (60/40)":  10,
+    "Noisy i.i.d. (Massart 10%)":      30,
+    "Noisy i.i.d. (Massart 40%)":      30,
     "Label flips (worst-case)":         1,
-    "Orthogonal (hard)":                1,
+    # "Orthogonal (hard)":                1,
 }
 
 # ==============================================================
@@ -334,8 +316,8 @@ plt.ylabel("g(T)")
 plt.legend()
 plt.tight_layout()
 
-# 3) Evaluate across revamped 5 streams
-rows, cols = 3, 2
+# 3) Evaluate across revamped 4 streams
+rows, cols = 2, 2
 fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
 axes = axes.flatten()
 
@@ -355,6 +337,6 @@ for idx, (title, seq_fn) in enumerate(CASES.items()):
 for j in range(len(CASES), rows * cols):
     axes[j].axis('off')
 
-fig.suptitle("Four algorithms across five streams (comparator = SVM hindsight)", fontsize=14)
+fig.suptitle("Four algorithms across four streams (comparator = SVM hindsight)", fontsize=14)
 fig.tight_layout()
 plt.show()
