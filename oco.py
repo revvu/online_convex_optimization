@@ -140,36 +140,110 @@ def simulate_empirical_g_SMART(z, y, u_comp, theta_emp, *, R=1.0, eta0=math.sqrt
     return simulate_SMART_like(z, y, u_comp, theta_thresh=theta_emp, R=R, eta0=eta0)
 
 # ==============================================================
-# Soft-margin SVM (Pegasos) for hindsight comparator
+# Soft-margin SVM for hindsight comparator
 # ==============================================================
 
-def pegasos_svm(X, y, *, lam, iters=None, batch_size=None, R=1.0, seed=0, epochs=100):
-    N, d = X.shape
-    batch_size = batch_size or min(100, N)
-    if iters is None:
-        iters = max(1, int(epochs * N / batch_size))  # ~epochs passes
-    rng = np.random.default_rng(seed)
-    w = np.zeros(d)
+def best_action_in_hindsight_svm(z: np.ndarray,
+                                 y: np.ndarray,
+                                 *,
+                                 R: float = 1.0,
+                                 C: float = 1.0,
+                                 seed: int = 0,
+                                 loss: str = "squared_hinge",
+                                 lam: float | None = None,
+                                 max_iters: int = 5000,
+                                 tol: float = 1e-7) -> np.ndarray:
+    """
+    Compute the hindsight comparator u* over the L2-ball {u: ||u|| <= R} by
+    minimizing an SVM-style empirical loss.
 
-    for t in range(1, iters + 1):
-        idx = rng.integers(0, N, size=batch_size)
-        Xb, yb = X[idx], y[idx]
-        margin = yb * (Xb @ w)
-        viol   = margin < 1.0
+    Objective (default, smooth):
+        min_{||u||<=R}  (lam/2)*||u||^2 + (1/N)*∑ (max(0, 1 - y_i z_i^T u))^2
 
-        eta = 1.0 / (lam * t)
-        if np.any(viol):
-            w = (1 - eta * lam) * w + (eta / batch_size) * (Xb[viol].T @ yb[viol])
-        else:
-            w = (1 - eta * lam) * w
+    Alternative:
+        set loss='hinge' to minimize (lam/2)||u||^2 + (1/N)*∑ max(0, 1 - y_i z_i^T u)
+        via projected subgradient.
 
-        w = project_to_ball(w, R)
-    return w
+    Notes:
+      - lam defaults to 1/C (constant wrt T). This avoids the horizon-dependent
+        comparator you had with lam=1/(C*N).  # (replaces previous behavior)
+      - Uses project_to_ball(...) already defined in this file.
+      - Deterministic (no SGD mini-batching).
+    """
+    import math
+    import numpy as np
+    from numpy.linalg import norm
 
-def best_action_in_hindsight_svm(z: np.ndarray, y: np.ndarray, *, R: float = 1.0, C: float = 1.0, seed: int = 0) -> np.ndarray:
-    N = len(y)
-    lam = 1.0 / max(C * N, 1.0)
-    return pegasos_svm(z, y, lam=lam, R=R, seed=seed)
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    y = np.sign(y); y[y == 0] = 1.0  # ensure ±1 labels
+
+    N, d = z.shape
+    Zy = z * y[:, None]             # margins: Zy @ u = y * (z·u)
+
+    # Regularization weight: keep independent of T by default
+    lam = (1.0 / max(C, 1e-12)) if lam is None else float(lam)
+
+    def proj_ball(x: np.ndarray) -> np.ndarray:
+        n = norm(x)
+        return x if (n == 0.0 or n <= R) else (R / n) * x
+
+    if loss.lower() == "squared_hinge":
+        # ----- FISTA for smooth objective (squared hinge) -----
+        # Safe Lipschitz constant: L <= lam + (2/N)*||Zy||_F^2
+        L = lam + (2.0 / N) * float((Zy * Zy).sum())
+        step = 1.0 / max(L, 1e-12)
+
+        u = np.zeros(d)
+        v = u.copy()
+        t = 1.0
+
+        for _ in range(1, max_iters + 1):
+            m = Zy @ v                 # margins y_i z_i^T v
+            s = 1.0 - m
+            active = (s > 0.0).astype(float)
+            # grad = lam*v - (2/N) * Zy^T[(1 - m)_+]
+            grad = lam * v - (2.0 / N) * (Zy.T @ (s * active))
+
+            u_next = proj_ball(v - step * grad)
+
+            t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+            v = u_next + ((t - 1.0) / t_next) * (u_next - u)
+
+            if norm(u_next - u) <= tol * max(1.0, norm(u)):
+                u = u_next
+                break
+
+            u, t = u_next, t_next
+
+        return u
+
+    elif loss.lower() == "hinge":
+        # ----- Projected subgradient for nonsmooth hinge -----
+        # Use a conservative base step from a crude Lipschitz bound
+        L_approx = lam + float((Zy * Zy).sum()) / max(1, N)
+        base = 1.0 / max(L_approx, 1e-12)
+
+        u = np.zeros(d)
+        for k in range(1, max_iters + 1):
+            m = Zy @ u
+            active = (m < 1.0).astype(float)
+            subgrad = lam * u - (1.0 / N) * (Zy.T @ active)
+
+            eta = base / math.sqrt(k)  # 1/√k schedule
+            u_next = proj_ball(u - eta * subgrad)
+
+            if np.linalg.norm(u_next - u) <= tol * max(1.0, np.linalg.norm(u)):
+                u = u_next
+                break
+
+            u = u_next
+
+        return u
+
+    else:
+        raise ValueError("loss must be 'squared_hinge' or 'hinge'")
+
 
 # ==============================================================
 # Streams (revamped 5-case suite)
