@@ -4,9 +4,11 @@ FTRL vs FTL vs SMART vs empirical_g_SMART
   using adversarial-ish sequences, per the SMART framework.
 - Comparator for regret: 'FTL-peek' best constant action in hindsight,
   i.e., normalize sum_t y_t z_t to radius R (no SVM).
-- Evaluation fix: For each stream and run, we *fix the task* (e.g., one u per run),
-  and for each T we draw a *fresh* T-length sequence from that task (no prefixing).
-  This removes cross-T task drift and yields smoother, more meaningful curves.
+- Evaluation smoothing:
+    * For each stream and run, we fix the task (one u per run).
+    * For each T we draw K fresh, independent sequences (replicates) from that task
+      and average within-run across replicates before aggregating across runs.
+    * We still show mean ± 95% CI, and overlay a dashed isotonic (monotone) trend.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ def regret_increment(q_pred: float, y_true: float, q_comp: float) -> float:
 
 def _seed_for(run_seed: int, T: int, salt: int = 0) -> int:
     """
-    Lightweight seed mixer to get independent RNGs for each (run, T).
+    Lightweight seed mixer to get independent RNGs for each (run, T, replicate).
     Returns a 32-bit seed for RandomState.
     """
     s = (run_seed * 1_000_003) ^ (T * 10_007) ^ (0xA5A5_5A5A + salt)
@@ -193,19 +195,19 @@ def orthogonal_hard_sequence(T: int, R: float = 1.0):
 
 
 # ==============================================================
-# NEW: Stream builders (fix task per run; fresh sequence for each T)
+# Stream builders (fix task per run; fresh sequence per T; now with replicates)
 # ==============================================================
 
 def make_random_iid_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
     """
-    One u per run; for each T we draw a fresh z[1:T] and labels y = sign(z·u).
+    One u per run; for each (T, replicate) we draw a fresh z and labels y = sign(z·u).
     """
     rng_u = np.random.RandomState(_seed_for(run_seed, T=0, salt=11))
     u = rng_u.randn(d)
     u /= max(norm2(u), 1e-12)
 
-    def sample(T: int):
-        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=13))
+    def sample(T: int, rep: int = 0):
+        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=13 + rep))
         z = rng.randn(T, d)
         z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
         y = np.sign(z @ u); y[y == 0] = 1.0
@@ -220,8 +222,8 @@ def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int
     u = rng_u.randn(d)
     u /= max(norm2(u), 1e-12)
 
-    def sample(T: int):
-        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=23))
+    def sample(T: int, rep: int = 0):
+        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=23 + rep))
         z = rng.randn(T, d)
         z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
         y = np.sign(z @ u); y[y == 0] = 1.0
@@ -231,26 +233,35 @@ def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int
     return sample
 
 def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):  # run_seed unused
-    def sample(T: int):
+    def sample(T: int, rep: int = 0):
         return flip_sequence(T, d=d, R=R)
     return sample
 
 
 # --- CASE SET (builders) ---
-CASES: Dict[str, Callable[..., Callable[[int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
+CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
     "Random i.i.d. (separable)":      lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
     "Noisy i.i.d. (Massart 10%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
     "Noisy i.i.d. (Massart 40%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.40, d=5, R=R, run_seed=run_seed),
     "Label flips (worst-case)":       lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
 }
 
-# Case-specific averaging to reduce variance where needed
+# Case-specific averaging controls
+# Average across tasks
 RUNS_BY_TITLE = {
-    "Random i.i.d. (separable)":       30,
-    "Noisy i.i.d. (Massart 10%)":      30,
-    "Noisy i.i.d. (Massart 40%)":      30,
+    "Random i.i.d. (separable)":       24,
+    "Noisy i.i.d. (Massart 10%)":      24,
+    "Noisy i.i.d. (Massart 40%)":      24,
     "Label flips (worst-case)":         1,
 }
+# Average across replicates
+REPLICATES_BY_TITLE = {
+    "Random i.i.d. (separable)":        8,
+    "Noisy i.i.d. (Massart 10%)":      10,
+    "Noisy i.i.d. (Massart 40%)":      12,
+    "Label flips (worst-case)":         1,
+}
+
 
 
 # ==============================================================
@@ -283,22 +294,61 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
 
 
 # ==============================================================
-# Evaluation (means and 95% CIs across runs)
+# Isotonic regression (PAVA) for monotone trend overlays
 # ==============================================================
 
-def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int], Tuple[np.ndarray, np.ndarray, np.ndarray]]],
+def isotonic_non_decreasing(y: np.ndarray) -> np.ndarray:
+    """
+    Pool Adjacent Violators Algorithm (PAVA) producing a nondecreasing fit.
+    No external dependencies.
+    """
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    blocks = [{'sum': y[0], 'w': 1.0, 'start': 0, 'end': 0}]
+    for i in range(1, n):
+        blocks.append({'sum': y[i], 'w': 1.0, 'start': i, 'end': i})
+        # Merge while monotonicity is violated
+        while len(blocks) >= 2:
+            a = blocks[-2]; b = blocks[-1]
+            if (a['sum']/a['w']) <= (b['sum']/b['w']):
+                break
+            # pool
+            new = {
+                'sum': a['sum'] + b['sum'],
+                'w':   a['w']   + b['w'],
+                'start': a['start'],
+                'end':   b['end'],
+            }
+            blocks.pop(); blocks.pop(); blocks.append(new)
+
+    yhat = np.zeros(n, dtype=float)
+    for blk in blocks:
+        val = blk['sum'] / blk['w']
+        yhat[blk['start']:blk['end'] + 1] = val
+    return yhat
+
+
+# ==============================================================
+# Evaluation (means and 95% CIs across runs; with replicates per T)
+# ==============================================================
+
+def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]],
                                T_grid: np.ndarray,
                                g_emp: Dict[int, float],
                                *,
                                runs: int = 1,
+                               replicates: int = 1,
                                R: float = 1.0,
                                base_seed: int = 0):
     """
-    Returns per-algorithm mean and 95% CI (normal approx) arrays over T_grid.
+    Returns per-algorithm mean and 95% CI arrays over T_grid.
     Keys: 'FTRL', 'FTL', 'SMART', 'EMP'  ->  (means, cis)
 
-    IMPORTANT: We fix the task per run via `stream_builder(run_seed)` and,
-    for each T, sample a fresh sequence (independent across T).
+    Procedure:
+      - For each run, build one task (sampler).
+      - For each T, draw 'replicates' independent datasets from that task,
+        compute regrets on each, average within-run across replicates,
+        then aggregate across runs.
     """
     keys = ["FTRL", "FTL", "SMART", "EMP"]
     by_T: Dict[str, list[list[float]]] = {k: [[] for _ in range(len(T_grid))] for k in keys}
@@ -308,13 +358,19 @@ def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int], Tup
         sampler = stream_builder(run_seed=run_seed, R=R)
 
         for ti, T in enumerate(T_grid):
-            z, y, _ = sampler(int(T))  # fresh sequence for this T, same task for this run
-            u_star = comparator_ftl_hindsight(z, y, R=R)
+            # Collect replicate regrets for this (run, T)
+            reps_vals = {k: [] for k in keys}
+            for rep in range(replicates):
+                z, y, _ = sampler(int(T), rep=rep)
+                u_star = comparator_ftl_hindsight(z, y, R=R)
+                reps_vals["FTRL"].append(simulate_alg(z, y, u_star, alg="FTRL", R=R))
+                reps_vals["FTL"].append(simulate_alg(z, y, u_star, alg="FTL",  R=R))
+                reps_vals["SMART"].append(simulate_SMART(z, y, u_star, R=R))
+                reps_vals["EMP"].append(simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R))
 
-            by_T["FTRL"][ti].append(simulate_alg(z, y, u_star, alg="FTRL", R=R))
-            by_T["FTL"][ti].append(simulate_alg(z, y, u_star, alg="FTL",  R=R))
-            by_T["SMART"][ti].append(simulate_SMART(z, y, u_star, R=R))
-            by_T["EMP"][ti].append(simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R))
+            # Average replicates for this run/T, then store for across-run aggregation
+            for k in keys:
+                by_T[k][ti].append(float(np.mean(reps_vals[k])))
 
     means: Dict[str, list[float]] = {k: [] for k in keys}
     cis:   Dict[str, list[float]] = {k: [] for k in keys}
@@ -334,10 +390,14 @@ def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int], Tup
     return stats
 
 
-def _plot_with_ci(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
+def _plot_with_ci_and_iso(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
+    # raw mean + 95% CI
     line, = ax.plot(x, mean, label=label)  # default color cycle
     if np.any(ci > 0.0):
         ax.fill_between(x, mean - ci, mean + ci, alpha=0.2, linewidth=0, color=line.get_color())
+    # isotonic (monotone) trend overlay
+    iso = isotonic_non_decreasing(mean)
+    ax.plot(x, iso, linestyle="--", linewidth=2, color=line.get_color(), alpha=0.8)
 
 
 # ==============================================================
@@ -368,22 +428,23 @@ if __name__ == "__main__":
     plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3) Evaluate across streams with CIs (task fixed per run; fresh sequences per T)
+    # 3) Evaluate across streams with per-T replicates and isotonic trend overlays
     rows, cols = 2, 2
     fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
     axes = axes.flatten()
 
     for idx, (title, builder) in enumerate(CASES.items()):
         ax = axes[idx]
-        runs = RUNS_BY_TITLE.get(title, 1)
+        runs       = RUNS_BY_TITLE.get(title, 1)
+        replicates = REPLICATES_BY_TITLE.get(title, 1)
 
-        stats = evaluate_stream_with_stats(builder, T_grid, g_emp, runs=runs, R=R)
-        _plot_with_ci(ax, T_grid, *stats["FTRL"], label="FTRL")
-        _plot_with_ci(ax, T_grid, *stats["FTL"],  label="FTL")
-        _plot_with_ci(ax, T_grid, *stats["SMART"], label="SMART (√2T)")
-        _plot_with_ci(ax, T_grid, *stats["EMP"],   label="SMART (empirical g from FTRL)")
+        stats = evaluate_stream_with_stats(builder, T_grid, g_emp, runs=runs, replicates=replicates, R=R)
+        _plot_with_ci_and_iso(ax, T_grid, *stats["FTRL"], label="FTRL")
+        _plot_with_ci_and_iso(ax, T_grid, *stats["FTL"],  label="FTL")
+        _plot_with_ci_and_iso(ax, T_grid, *stats["SMART"], label="SMART (√2T)")
+        _plot_with_ci_and_iso(ax, T_grid, *stats["EMP"],   label="SMART (empirical g from FTRL)")
 
-        ax.set_title(f"{title} (N={runs})", fontsize=10)
+        ax.set_title(f"{title} (runs={runs}, reps/T={replicates})", fontsize=10)
         ax.set_xlabel("T rounds")
         ax.set_ylabel("Cumulative regret")
         ax.legend()
@@ -391,7 +452,7 @@ if __name__ == "__main__":
     for j in range(len(CASES), rows * cols):
         axes[j].axis('off')
 
-    fig.suptitle("Mean cumulative regret ± 95% CI (comparator = FTL-peek constant)", fontsize=14)
+    fig.suptitle("Mean cumulative regret ± 95% CI (dashed: isotonic trend)\n(comparator = FTL-peek constant)", fontsize=14)
     fig.tight_layout()
     plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
     plt.savefig('algorithm_comparison_CI.png', dpi=300, bbox_inches='tight')
