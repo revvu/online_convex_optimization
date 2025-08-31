@@ -8,7 +8,7 @@ FTRL vs FTL vs SMART vs empirical_g_SMART
     * For each stream and run, we fix the task (one u per run).
     * For each T we draw K fresh, independent sequences (replicates) from that task
       and average within-run across replicates before aggregating across runs.
-    * We still show mean ± 95% CI, and overlay a dashed isotonic (monotone) trend.
+    * We still show mean ± 95% CI.
 - With tqdm progress bars that clearly label which stream/run/T is being processed.
 """
 
@@ -423,7 +423,7 @@ if __name__ == "__main__":
     for j in range(len(CASES), rows * cols):
         axes[j].axis('off')
 
-    fig.suptitle("Mean cumulative regret ± 95% CI (dashed: isotonic trend)\n(comparator = FTL-peek constant)", fontsize=14)
+    fig.suptitle("Mean cumulative regret ± 95% CI", fontsize=14)
     fig.tight_layout()
     plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
     plt.close()

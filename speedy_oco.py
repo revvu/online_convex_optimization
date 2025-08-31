@@ -486,7 +486,7 @@ if __name__ == "__main__":
     plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3) Evaluate across streams with per-T replicates and isotonic trend overlays
+    # 3) Evaluate across streams with per-T replicates
     rows, cols = 2, 2
     fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
     axes = axes.flatten()
@@ -512,7 +512,7 @@ if __name__ == "__main__":
     for j in range(len(CASES), rows * cols):
         axes[j].axis('off')
 
-    fig.suptitle("Mean cumulative regret ± 95% CI (dashed: isotonic trend)\n(comparator = FTL-peek constant)", fontsize=14)
+    fig.suptitle("Mean cumulative regret ± 95% CI", fontsize=14)
     fig.tight_layout()
     plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
     plt.close()
