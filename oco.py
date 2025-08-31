@@ -4,14 +4,14 @@ FTRL vs FTL vs SMART vs empirical_g_SMART
   using adversarial-ish sequences, per the SMART framework.
 - Comparator for regret: 'FTL-peek' best constant action in hindsight,
   i.e., normalize sum_t y_t z_t to radius R (no SVM).
-- Visuals: For each stream we plot mean cumulative regret across runs with
-  a shaded 95% CI (normal approximation) when N > 1.
+- Evaluation fix: For each stream and run, we *fix the task* (e.g., one u per run),
+  and for each T we draw a *fresh* T-length sequence from that task (no prefixing).
+  This removes cross-T task drift and yields smoother, more meaningful curves.
 """
 
 from __future__ import annotations
 
 import math
-from functools import partial
 from typing import Callable, Dict, Tuple
 
 import matplotlib.pyplot as plt
@@ -38,6 +38,14 @@ def normalized_hinge(q: float, y: float) -> float:
 
 def regret_increment(q_pred: float, y_true: float, q_comp: float) -> float:
     return normalized_hinge(q_pred, y_true) - normalized_hinge(q_comp, y_true)
+
+def _seed_for(run_seed: int, T: int, salt: int = 0) -> int:
+    """
+    Lightweight seed mixer to get independent RNGs for each (run, T).
+    Returns a 32-bit seed for RandomState.
+    """
+    s = (run_seed * 1_000_003) ^ (T * 10_007) ^ (0xA5A5_5A5A + salt)
+    return int(s & 0xFFFF_FFFF)
 
 
 # ==============================================================
@@ -166,31 +174,8 @@ def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, u_comp: np.ndarray,
 
 
 # ==============================================================
-# Streams (revamped 5-case suite)
+# Adversarial families used for g(T)
 # ==============================================================
-
-def random_iid_sequence(T: int, d: int = 5, R: float = 1.0):
-    z = np.random.randn(T, d)
-    z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
-    u = np.random.randn(d)
-    mm = np.max(np.abs(z @ u))
-    if mm > 1.0:
-        u = u / mm
-    y = np.sign(z @ u); y[y == 0] = 1
-    return z, y.astype(float), u
-
-def noisy_iid_sequence(T: int, d: int = 5, R: float = 1.0, p: float = 0.1):
-    """Massart-like label noise on top of separable i.i.d."""
-    z = np.random.randn(T, d)
-    z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
-    u = np.random.randn(d)
-    mm = np.max(np.abs(z @ u))
-    if mm > 1.0:
-        u = u / mm
-    y = np.sign(z @ u); y[y == 0] = 1
-    flips = np.random.rand(T) < p
-    y[flips] *= -1
-    return z, y.astype(float), u
 
 def flip_sequence(T: int, d: int = 5, R: float = 1.0):
     z = np.zeros((T, d)); z[:, 0] = R
@@ -207,22 +192,64 @@ def orthogonal_hard_sequence(T: int, R: float = 1.0):
     return z, y, u
 
 
-# --- UPDATED CASE SET ---
-CASES = {
-    "Random i.i.d. (separable)":        random_iid_sequence,
-    "Noisy i.i.d. (Massart 10%)":       partial(noisy_iid_sequence, p=0.10),
-    "Noisy i.i.d. (Massart 40%)":       partial(noisy_iid_sequence, p=0.40),
-    "Label flips (worst-case)":         flip_sequence,
-    # "Orthogonal (hard)":                orthogonal_hard_sequence,
+# ==============================================================
+# NEW: Stream builders (fix task per run; fresh sequence for each T)
+# ==============================================================
+
+def make_random_iid_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
+    """
+    One u per run; for each T we draw a fresh z[1:T] and labels y = sign(z·u).
+    """
+    rng_u = np.random.RandomState(_seed_for(run_seed, T=0, salt=11))
+    u = rng_u.randn(d)
+    u /= max(norm2(u), 1e-12)
+
+    def sample(T: int):
+        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=13))
+        z = rng.randn(T, d)
+        z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
+        y = np.sign(z @ u); y[y == 0] = 1.0
+        return z, y.astype(float), u
+    return sample
+
+def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int = 0):
+    """
+    Same as random_iid, but flip labels independently with prob p per example.
+    """
+    rng_u = np.random.RandomState(_seed_for(run_seed, T=0, salt=21))
+    u = rng_u.randn(d)
+    u /= max(norm2(u), 1e-12)
+
+    def sample(T: int):
+        rng = np.random.RandomState(_seed_for(run_seed, T=int(T), salt=23))
+        z = rng.randn(T, d)
+        z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1.0) * R
+        y = np.sign(z @ u); y[y == 0] = 1.0
+        flips = rng.rand(T) < p
+        y[flips] *= -1.0
+        return z, y.astype(float), u
+    return sample
+
+def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):  # run_seed unused
+    def sample(T: int):
+        return flip_sequence(T, d=d, R=R)
+    return sample
+
+
+# --- CASE SET (builders) ---
+CASES: Dict[str, Callable[..., Callable[[int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
+    "Random i.i.d. (separable)":      lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
+    "Noisy i.i.d. (Massart 10%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
+    "Noisy i.i.d. (Massart 40%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.40, d=5, R=R, run_seed=run_seed),
+    "Label flips (worst-case)":       lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
 }
 
-# Optional: case-specific averaging to reduce variance where needed
+# Case-specific averaging to reduce variance where needed
 RUNS_BY_TITLE = {
     "Random i.i.d. (separable)":       30,
     "Noisy i.i.d. (Massart 10%)":      30,
     "Noisy i.i.d. (Massart 40%)":      30,
     "Label flips (worst-case)":         1,
-    # "Orthogonal (hard)":                1,
 }
 
 
@@ -259,7 +286,7 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
 # Evaluation (means and 95% CIs across runs)
 # ==============================================================
 
-def evaluate_stream_with_stats(seq_fn: Callable[..., Tuple[np.ndarray, np.ndarray, np.ndarray]],
+def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int], Tuple[np.ndarray, np.ndarray, np.ndarray]]],
                                T_grid: np.ndarray,
                                g_emp: Dict[int, float],
                                *,
@@ -269,42 +296,48 @@ def evaluate_stream_with_stats(seq_fn: Callable[..., Tuple[np.ndarray, np.ndarra
     """
     Returns per-algorithm mean and 95% CI (normal approx) arrays over T_grid.
     Keys: 'FTRL', 'FTL', 'SMART', 'EMP'  ->  (means, cis)
+
+    IMPORTANT: We fix the task per run via `stream_builder(run_seed)` and,
+    for each T, sample a fresh sequence (independent across T).
     """
-    means = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
-    cis   = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
+    keys = ["FTRL", "FTL", "SMART", "EMP"]
+    by_T: Dict[str, list[list[float]]] = {k: [[] for _ in range(len(T_grid))] for k in keys}
 
-    for T in T_grid:
-        lists = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
-        for r in range(runs):
-            np.random.seed(base_seed + 2025 * (int(T) + r))
-            z, y, _ = seq_fn(int(T), R=R) if seq_fn is orthogonal_hard_sequence else seq_fn(int(T), R=R)
+    for run in range(runs):
+        run_seed = base_seed + 2025 * (run + 1)
+        sampler = stream_builder(run_seed=run_seed, R=R)
+
+        for ti, T in enumerate(T_grid):
+            z, y, _ = sampler(int(T))  # fresh sequence for this T, same task for this run
             u_star = comparator_ftl_hindsight(z, y, R=R)
-            lists["FTRL"].append(simulate_alg(z, y, u_star, alg="FTRL", R=R))
-            lists["FTL"].append(simulate_alg(z, y, u_star, alg="FTL",  R=R))
-            lists["SMART"].append(simulate_SMART(z, y, u_star, R=R))
-            lists["EMP"].append(simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R))
 
-        for k in lists:
-            vals = np.array(lists[k], dtype=float)
-            mu = float(np.mean(vals))
-            if runs > 1:
-                sem = float(np.std(vals, ddof=1)) / math.sqrt(runs)
+            by_T["FTRL"][ti].append(simulate_alg(z, y, u_star, alg="FTRL", R=R))
+            by_T["FTL"][ti].append(simulate_alg(z, y, u_star, alg="FTL",  R=R))
+            by_T["SMART"][ti].append(simulate_SMART(z, y, u_star, R=R))
+            by_T["EMP"][ti].append(simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R))
+
+    means: Dict[str, list[float]] = {k: [] for k in keys}
+    cis:   Dict[str, list[float]] = {k: [] for k in keys}
+    for k in keys:
+        for vals in by_T[k]:
+            arr = np.array(vals, dtype=float)
+            mu = float(np.mean(arr))
+            if arr.size > 1:
+                sem = float(np.std(arr, ddof=1)) / math.sqrt(arr.size)
                 ci = 1.96 * sem
             else:
                 ci = 0.0
             means[k].append(mu)
             cis[k].append(ci)
 
-    # convert to arrays
-    stats = {k: (np.array(means[k]), np.array(cis[k])) for k in means}
+    stats = {k: (np.array(means[k]), np.array(cis[k])) for k in keys}
     return stats
 
 
 def _plot_with_ci(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
-    line, = ax.plot(x, mean, label=label)  # use default color cycle
+    line, = ax.plot(x, mean, label=label)  # default color cycle
     if np.any(ci > 0.0):
-        ax.fill_between(x, mean - ci, mean + ci,
-                        alpha=0.2, linewidth=0, color=line.get_color())
+        ax.fill_between(x, mean - ci, mean + ci, alpha=0.2, linewidth=0, color=line.get_color())
 
 
 # ==============================================================
@@ -335,16 +368,16 @@ if __name__ == "__main__":
     plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3) Evaluate across streams with CIs
+    # 3) Evaluate across streams with CIs (task fixed per run; fresh sequences per T)
     rows, cols = 2, 2
     fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
     axes = axes.flatten()
 
-    for idx, (title, seq_fn) in enumerate(CASES.items()):
+    for idx, (title, builder) in enumerate(CASES.items()):
         ax = axes[idx]
         runs = RUNS_BY_TITLE.get(title, 1)
 
-        stats = evaluate_stream_with_stats(seq_fn, T_grid, g_emp, runs=runs, R=R)
+        stats = evaluate_stream_with_stats(builder, T_grid, g_emp, runs=runs, R=R)
         _plot_with_ci(ax, T_grid, *stats["FTRL"], label="FTRL")
         _plot_with_ci(ax, T_grid, *stats["FTL"],  label="FTL")
         _plot_with_ci(ax, T_grid, *stats["SMART"], label="SMART (√2T)")
@@ -360,6 +393,6 @@ if __name__ == "__main__":
 
     fig.suptitle("Mean cumulative regret ± 95% CI (comparator = FTL-peek constant)", fontsize=14)
     fig.tight_layout()
-    plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')           # keep original name
-    plt.savefig('algorithm_comparison_CI.png', dpi=300, bbox_inches='tight')       # explicit CI version
+    plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('algorithm_comparison_CI.png', dpi=300, bbox_inches='tight')
     plt.close()
