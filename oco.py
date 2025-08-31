@@ -2,23 +2,28 @@
 FTRL vs FTL vs SMART vs empirical_g_SMART
 - SMART's threshold g(T) is estimated from a near-minimax backup algorithm (FTRL),
   using adversarial-ish sequences, per the SMART framework.
-- Comparator for regret is the best constant action in hindsight from a soft-margin SVM.
+- Comparator for regret: 'FTL-peek' best constant action in hindsight,
+  i.e., normalize sum_t y_t z_t to radius R (no SVM).
+- Visuals: For each stream we plot mean cumulative regret across runs with
+  a shaded 95% CI (normal approximation) when N > 1.
 """
 
 from __future__ import annotations
 
 import math
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import Callable, Dict, Tuple
 from functools import partial
+from typing import Callable, Dict, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 # ==============================================================
 # Utilities
 # ==============================================================
 
-def clip_unit(q):
-    return np.clip(q, -1.0, 1.0)
+def clip_unit(q: float) -> float:
+    return float(np.clip(q, -1.0, 1.0))
 
 def norm2(x: np.ndarray) -> float:
     return float(np.linalg.norm(x))
@@ -33,6 +38,7 @@ def normalized_hinge(q: float, y: float) -> float:
 
 def regret_increment(q_pred: float, y_true: float, q_comp: float) -> float:
     return normalized_hinge(q_pred, y_true) - normalized_hinge(q_comp, y_true)
+
 
 # ==============================================================
 # Actions: FTL and FTRL
@@ -51,8 +57,9 @@ def action_ftrl(theta: np.ndarray, t: int, R: float = 1.0, eta0: float = math.sq
     x = -eta_t * theta
     return project_to_ball(x, R)
 
+
 # ==============================================================
-# Online simulation (FTL, FTRL), regret vs SVM comparator
+# Online simulation (FTL, FTRL), regret vs comparator
 # ==============================================================
 
 def simulate_alg(z: np.ndarray,
@@ -78,6 +85,24 @@ def simulate_alg(z: np.ndarray,
         theta += grad_q * z[t-1]
 
     return cum_reg
+
+
+# ==============================================================
+# Hindsight comparator: FTL-peek (constant)
+# ==============================================================
+
+def comparator_ftl_hindsight(z: np.ndarray,
+                             y: np.ndarray,
+                             *,
+                             R: float = 1.0) -> np.ndarray:
+    """
+    Best constant action via the FTL map on linearized losses:
+        u* = R * (sum_t y_t z_t) / ||sum_t y_t z_t||, or 0 if the sum is 0.
+    """
+    s = (y.reshape(-1, 1) * z).sum(axis=0)
+    n = norm2(s)
+    return np.zeros_like(s) if n == 0.0 else (R * s / n)
+
 
 # ==============================================================
 # SMART (single switch) with proper reset of ALG_WC
@@ -132,117 +157,12 @@ def simulate_SMART_like(z: np.ndarray,
 
     return total_reg
 
-def simulate_SMART(z, y, u_comp, *, R=1.0, eta0=math.sqrt(2)) -> float:
+def simulate_SMART(z: np.ndarray, y: np.ndarray, u_comp: np.ndarray, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
     T = z.shape[0]
     return simulate_SMART_like(z, y, u_comp, theta_thresh=math.sqrt(2*T), R=R, eta0=eta0)
 
-def simulate_empirical_g_SMART(z, y, u_comp, theta_emp, *, R=1.0, eta0=math.sqrt(2)) -> float:
+def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, u_comp: np.ndarray, theta_emp: float, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
     return simulate_SMART_like(z, y, u_comp, theta_thresh=theta_emp, R=R, eta0=eta0)
-
-# ==============================================================
-# Soft-margin SVM for hindsight comparator
-# ==============================================================
-
-def best_action_in_hindsight_svm(z: np.ndarray,
-                                 y: np.ndarray,
-                                 *,
-                                 R: float = 1.0,
-                                 C: float = 1.0,
-                                 seed: int = 0,
-                                 loss: str = "squared_hinge",
-                                 lam: float | None = None,
-                                 max_iters: int = 5000,
-                                 tol: float = 1e-7) -> np.ndarray:
-    """
-    Compute the hindsight comparator u* over the L2-ball {u: ||u|| <= R} by
-    minimizing an SVM-style empirical loss.
-
-    Objective (default, smooth):
-        min_{||u||<=R}  (lam/2)*||u||^2 + (1/N)*∑ (max(0, 1 - y_i z_i^T u))^2
-
-    Alternative:
-        set loss='hinge' to minimize (lam/2)||u||^2 + (1/N)*∑ max(0, 1 - y_i z_i^T u)
-        via projected subgradient.
-
-    Notes:
-      - lam defaults to 1/C (constant wrt T). This avoids the horizon-dependent
-        comparator you had with lam=1/(C*N).  # (replaces previous behavior)
-      - Uses project_to_ball(...) already defined in this file.
-      - Deterministic (no SGD mini-batching).
-    """
-    import math
-    import numpy as np
-    from numpy.linalg import norm
-
-    z = np.asarray(z, dtype=float)
-    y = np.asarray(y, dtype=float).reshape(-1)
-    y = np.sign(y); y[y == 0] = 1.0  # ensure ±1 labels
-
-    N, d = z.shape
-    Zy = z * y[:, None]             # margins: Zy @ u = y * (z·u)
-
-    # Regularization weight: keep independent of T by default
-    lam = (1.0 / max(C, 1e-12)) if lam is None else float(lam)
-
-    def proj_ball(x: np.ndarray) -> np.ndarray:
-        n = norm(x)
-        return x if (n == 0.0 or n <= R) else (R / n) * x
-
-    if loss.lower() == "squared_hinge":
-        # ----- FISTA for smooth objective (squared hinge) -----
-        # Safe Lipschitz constant: L <= lam + (2/N)*||Zy||_F^2
-        L = lam + (2.0 / N) * float((Zy * Zy).sum())
-        step = 1.0 / max(L, 1e-12)
-
-        u = np.zeros(d)
-        v = u.copy()
-        t = 1.0
-
-        for _ in range(1, max_iters + 1):
-            m = Zy @ v                 # margins y_i z_i^T v
-            s = 1.0 - m
-            active = (s > 0.0).astype(float)
-            # grad = lam*v - (2/N) * Zy^T[(1 - m)_+]
-            grad = lam * v - (2.0 / N) * (Zy.T @ (s * active))
-
-            u_next = proj_ball(v - step * grad)
-
-            t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
-            v = u_next + ((t - 1.0) / t_next) * (u_next - u)
-
-            if norm(u_next - u) <= tol * max(1.0, norm(u)):
-                u = u_next
-                break
-
-            u, t = u_next, t_next
-
-        return u
-
-    elif loss.lower() == "hinge":
-        # ----- Projected subgradient for nonsmooth hinge -----
-        # Use a conservative base step from a crude Lipschitz bound
-        L_approx = lam + float((Zy * Zy).sum()) / max(1, N)
-        base = 1.0 / max(L_approx, 1e-12)
-
-        u = np.zeros(d)
-        for k in range(1, max_iters + 1):
-            m = Zy @ u
-            active = (m < 1.0).astype(float)
-            subgrad = lam * u - (1.0 / N) * (Zy.T @ active)
-
-            eta = base / math.sqrt(k)  # 1/√k schedule
-            u_next = proj_ball(u - eta * subgrad)
-
-            if np.linalg.norm(u_next - u) <= tol * max(1.0, np.linalg.norm(u)):
-                u = u_next
-                break
-
-            u = u_next
-
-        return u
-
-    else:
-        raise ValueError("loss must be 'squared_hinge' or 'hinge'")
 
 
 # ==============================================================
@@ -287,7 +207,6 @@ def orthogonal_hard_sequence(T: int, R: float = 1.0):
     return z, y, u
 
 
-
 # --- UPDATED CASE SET ---
 CASES = {
     "Random i.i.d. (separable)":        random_iid_sequence,
@@ -306,6 +225,7 @@ RUNS_BY_TITLE = {
     # "Orthogonal (hard)":                1,
 }
 
+
 # ==============================================================
 # Empirical g(T) from the worst-case (near-minimax) backup alg.
 # ==============================================================
@@ -314,7 +234,6 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
                                     *,
                                     runs: int = 5,
                                     R: float = 1.0,
-                                    C: float = 1.0,
                                     base_seed: int = 0) -> Dict[int, float]:
     """
     Approximate g(T) as the maximum regret of ALG_WC = FTRL across adverse families.
@@ -329,91 +248,118 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
             for r in range(runs):
                 np.random.seed(base_seed + 1337 * (int(T) + r))
                 z, y, _ = fam(int(T), R=R) if fam is orthogonal_hard_sequence else fam(int(T), R=R)
-                u_star = best_action_in_hindsight_svm(z, y, R=R, C=C, seed=base_seed + 7919 * (int(T) + r))
+                u_star = comparator_ftl_hindsight(z, y, R=R)
                 reg_ftrl = simulate_alg(z, y, u_star, alg="FTRL", R=R)
                 worst = max(worst, reg_ftrl)
         g_emp[int(T)] = worst
     return g_emp
 
+
 # ==============================================================
-# Evaluation
+# Evaluation (means and 95% CIs across runs)
 # ==============================================================
 
-def evaluate_stream(seq_fn: Callable[..., Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                    T_grid: np.ndarray,
-                    g_emp: Dict[int, float],
-                    *,
-                    runs: int = 1,
-                    R: float = 1.0,
-                    C: float = 1.0,
-                    base_seed: int = 0):
-    r_ftrl, r_ftl, r_smart, r_emp = [], [], [], []
+def evaluate_stream_with_stats(seq_fn: Callable[..., Tuple[np.ndarray, np.ndarray, np.ndarray]],
+                               T_grid: np.ndarray,
+                               g_emp: Dict[int, float],
+                               *,
+                               runs: int = 1,
+                               R: float = 1.0,
+                               base_seed: int = 0):
+    """
+    Returns per-algorithm mean and 95% CI (normal approx) arrays over T_grid.
+    Keys: 'FTRL', 'FTL', 'SMART', 'EMP'  ->  (means, cis)
+    """
+    means = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
+    cis   = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
+
     for T in T_grid:
-        ftrl = ftl = smart = emp = 0.0
+        lists = {k: [] for k in ["FTRL", "FTL", "SMART", "EMP"]}
         for r in range(runs):
             np.random.seed(base_seed + 2025 * (int(T) + r))
             z, y, _ = seq_fn(int(T), R=R) if seq_fn is orthogonal_hard_sequence else seq_fn(int(T), R=R)
-            u_star = best_action_in_hindsight_svm(z, y, R=R, C=C, seed=base_seed + 101 * (int(T) + r))
-            ftrl  += simulate_alg(z, y, u_star, alg="FTRL", R=R)
-            ftl   += simulate_alg(z, y, u_star, alg="FTL",  R=R)
-            smart += simulate_SMART(z, y, u_star, R=R)
-            emp   += simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R)
-        r_ftrl.append(ftrl / runs)
-        r_ftl.append(ftl  / runs)
-        r_smart.append(smart / runs)
-        r_emp.append(emp / runs)
-    return r_ftrl, r_ftl, r_smart, r_emp
+            u_star = comparator_ftl_hindsight(z, y, R=R)
+            lists["FTRL"].append(simulate_alg(z, y, u_star, alg="FTRL", R=R))
+            lists["FTL"].append(simulate_alg(z, y, u_star, alg="FTL",  R=R))
+            lists["SMART"].append(simulate_SMART(z, y, u_star, R=R))
+            lists["EMP"].append(simulate_empirical_g_SMART(z, y, u_star, g_emp[int(T)], R=R))
+
+        for k in lists:
+            vals = np.array(lists[k], dtype=float)
+            mu = float(np.mean(vals))
+            if runs > 1:
+                sem = float(np.std(vals, ddof=1)) / math.sqrt(runs)
+                ci = 1.96 * sem
+            else:
+                ci = 0.0
+            means[k].append(mu)
+            cis[k].append(ci)
+
+    # convert to arrays
+    stats = {k: (np.array(means[k]), np.array(cis[k])) for k in means}
+    return stats
+
+
+def _plot_with_ci(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
+    line, = ax.plot(x, mean, label=label)  # use default color cycle
+    if np.any(ci > 0.0):
+        ax.fill_between(x, mean - ci, mean + ci,
+                        alpha=0.2, linewidth=0, color=line.get_color())
+
 
 # ==============================================================
 # Main
 # ==============================================================
 
-np.random.seed(0)
+if __name__ == "__main__":
+    np.random.seed(0)
 
-# Experiment settings
-R        = 1.0       # action set radius
-C        = 1.0       # SVM "C" via λ = 1/(C*N)
-T_grid   = np.arange(100, 1100, 100)
+    # Experiment settings
+    R        = 1.0
+    T_grid   = np.arange(100, 1100, 100)
 
-# 1) Empirically estimate g(T) from FTRL on adversarial families (near-minimax)
-g_emp = empirical_worst_case_thresholds(T_grid, runs=5, R=R, C=C)
+    # 1) Empirically estimate g(T) from FTRL on adversarial families (near-minimax)
+    g_emp = empirical_worst_case_thresholds(T_grid, runs=5, R=R)
 
-# 2) Plot empirical g(T) vs theoretical sqrt(2T)
-plt.figure(figsize=(7.5, 5.0))
-g_vals = [g_emp[int(T)] for T in T_grid]
-theory = [math.sqrt(2 * T) for T in T_grid]
-plt.plot(T_grid, g_vals,  marker="o", label="Empirical g(T) from FTRL (worst-case families)")
-plt.plot(T_grid, theory,  marker="x", label=r"Theory $\sqrt{2T}$ (scale comparator)")
-plt.title("Empirical worst-case g(T) for SMART (ALG_WC = FTRL)")
-plt.xlabel("T rounds")
-plt.ylabel("g(T)")
-plt.legend()
-plt.tight_layout()
-plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
-plt.close()
+    # 2) Plot empirical g(T) vs theoretical sqrt(2T)
+    plt.figure(figsize=(7.5, 5.0))
+    g_vals = [g_emp[int(T)] for T in T_grid]
+    theory = [math.sqrt(2 * T) for T in T_grid]
+    plt.plot(T_grid, g_vals,  marker="o", label="Empirical g(T) from FTRL (worst-case families)")
+    plt.plot(T_grid, theory,  marker="x", label=r"Theory $\sqrt{2T}$ (scale comparator)")
+    plt.title("Empirical worst-case g(T) for SMART (ALG_WC = FTRL)")
+    plt.xlabel("T rounds")
+    plt.ylabel("g(T)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
+    plt.close()
 
-# 3) Evaluate across revamped 4 streams
-rows, cols = 2, 2
-fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
-axes = axes.flatten()
+    # 3) Evaluate across streams with CIs
+    rows, cols = 2, 2
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
+    axes = axes.flatten()
 
-for idx, (title, seq_fn) in enumerate(CASES.items()):
-    ax = axes[idx]
-    runs = RUNS_BY_TITLE.get(title, 1)
-    ftrl, ftl, smart, emp = evaluate_stream(seq_fn, T_grid, g_emp, runs=runs, R=R, C=C)
-    ax.plot(T_grid, ftrl,  label="FTRL")
-    ax.plot(T_grid, ftl,   label="FTL")
-    ax.plot(T_grid, smart, label="SMART (√2T)")
-    ax.plot(T_grid, emp,   label="SMART (empirical g from FTRL)")
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("T rounds")
-    ax.set_ylabel("Cumulative regret")
-    ax.legend()
+    for idx, (title, seq_fn) in enumerate(CASES.items()):
+        ax = axes[idx]
+        runs = RUNS_BY_TITLE.get(title, 1)
 
-for j in range(len(CASES), rows * cols):
-    axes[j].axis('off')
+        stats = evaluate_stream_with_stats(seq_fn, T_grid, g_emp, runs=runs, R=R)
+        _plot_with_ci(ax, T_grid, *stats["FTRL"], label="FTRL")
+        _plot_with_ci(ax, T_grid, *stats["FTL"],  label="FTL")
+        _plot_with_ci(ax, T_grid, *stats["SMART"], label="SMART (√2T)")
+        _plot_with_ci(ax, T_grid, *stats["EMP"],   label="SMART (empirical g from FTRL)")
 
-fig.suptitle("Four algorithms across four streams (comparator = SVM hindsight)", fontsize=14)
-fig.tight_layout()
-plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
-plt.close()
+        ax.set_title(f"{title} (N={runs})", fontsize=10)
+        ax.set_xlabel("T rounds")
+        ax.set_ylabel("Cumulative regret")
+        ax.legend()
+
+    for j in range(len(CASES), rows * cols):
+        axes[j].axis('off')
+
+    fig.suptitle("Mean cumulative regret ± 95% CI (comparator = FTL-peek constant)", fontsize=14)
+    fig.tight_layout()
+    plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')           # keep original name
+    plt.savefig('algorithm_comparison_CI.png', dpi=300, bbox_inches='tight')       # explicit CI version
+    plt.close()
