@@ -1,10 +1,17 @@
 """
 FTRL vs FTL vs SMART vs empirical_g_SMART
+
 Speed-optimized (no change to runs/replicates/T):
 - Numba JIT for hot loops (simulate_alg, simulate_SMART_like, helpers)
 - float32 arrays for data and parameters
 - Modern RNG (np.random.Generator + SeedSequence)
 - Same behavior, faster execution
+
+Includes:
+- "Two leaders (√t gap)" deterministic sequence (blocks) — FTL ≫ FTRL.
+- "Stochastic √t-gap (Bernoulli drift)" — cleaner, non-contrived analogue.
+- "Two leaders (switching, no drift)" — simple alternating leaders with fixed blocks.
+- Diagnostic plot for the deterministic √t-gap sequence.
 """
 
 from __future__ import annotations
@@ -49,7 +56,6 @@ def _clip_unit_scalar(q: float) -> float:
 
 @njit(cache=True, fastmath=True)
 def _norm2(x: np.ndarray) -> float:
-    # Euclidean norm (float32-safe)
     s = 0.0
     for i in range(x.size):
         s += float(x[i]) * float(x[i])
@@ -57,16 +63,15 @@ def _norm2(x: np.ndarray) -> float:
 
 @njit(cache=True, fastmath=True)
 def _project_to_ball(x: np.ndarray, R: float) -> None:
-    # In-place projection to L2 ball of radius R
     n = _norm2(x)
-    if n > 0.0 and n > R:
+    if n > R and n > 0.0:
         scale = R / n
         for i in range(x.size):
             x[i] *= scale
 
 @njit(cache=True, fastmath=True)
 def _normalized_hinge(q: float, y: float) -> float:
-    # 0.5 * |q - y|, with y in {±1}, q ∈ [-1,1]
+    # y in {±1}, q ∈ [-1,1]; equals 0 if correct sign at ±1, 1 if wrong sign at ∓1
     diff = q - y
     if diff < 0:
         diff = -diff
@@ -78,7 +83,6 @@ def _regret_increment(q_pred: float, y_true: float, q_comp: float) -> float:
 
 @njit(cache=True, fastmath=True)
 def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
-    # out = -R * theta / ||theta||
     n = _norm2(theta)
     if n == 0.0:
         for i in range(theta.size):
@@ -90,7 +94,6 @@ def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
 
 @njit(cache=True, fastmath=True)
 def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarray) -> None:
-    # out = project( -eta_t * theta )
     eta_t = eta0 / math.sqrt(float(max(1, t)))
     for i in range(theta.size):
         out[i] = -eta_t * theta[i]
@@ -108,11 +111,6 @@ def simulate_alg(z: np.ndarray,
                  alg_flag: int,  # 0 = FTRL, 1 = FTL
                  R: float,
                  eta0: float) -> float:
-    """
-    z: (T, d) float32
-    y: (T,)   float32 in {±1}
-    u_comp: (d,) float32
-    """
     T, d = z.shape
     theta = np.zeros(d, dtype=np.float32)
     x_t   = np.zeros(d, dtype=np.float32)
@@ -120,7 +118,6 @@ def simulate_alg(z: np.ndarray,
     # Precompute q_uc[t] = clip(z[t]·u_comp)
     q_uc_vec = np.empty(T, dtype=np.float32)
     for t in range(T):
-        # dot
         s = 0.0
         for j in range(d):
             s += float(z[t, j]) * float(u_comp[j])
@@ -128,21 +125,18 @@ def simulate_alg(z: np.ndarray,
 
     cum_reg = 0.0
     for t in range(T):
-        if alg_flag == 0:  # FTRL
+        if alg_flag == 0:
             _action_ftrl(theta, t + 1, R, eta0, x_t)
-        else:              # FTL
+        else:
             _action_ftl(theta, R, x_t)
 
-        # q = clip(z[t]·x_t)
         s = 0.0
         for j in range(d):
             s += float(z[t, j]) * float(x_t[j])
         q = _clip_unit_scalar(s)
 
-        # regret increment vs comparator
         cum_reg += _regret_increment(q, float(y[t]), float(q_uc_vec[t]))
 
-        # grad wrt x via q=z·x: grad_q = 0.5 * sign(q - y[t])
         diff = q - float(y[t])
         grad_q = 0.0
         if diff > 0.0:
@@ -150,7 +144,6 @@ def simulate_alg(z: np.ndarray,
         elif diff < 0.0:
             grad_q = -0.5
 
-        # theta += grad_q * z[t]
         for j in range(d):
             theta[j] += grad_q * float(z[t, j])
 
@@ -158,14 +151,11 @@ def simulate_alg(z: np.ndarray,
 
 
 # ==============================================================
-# Hindsight comparator: FTL-peek (constant)
+# Hindsight comparator: best fixed linear predictor
 # ==============================================================
 
 @njit(cache=True, fastmath=True)
 def comparator_ftl_hindsight(z: np.ndarray, y: np.ndarray, R: float) -> np.ndarray:
-    """
-    u* = R * (sum_t y_t z_t) / ||sum_t y_t z_t||, or 0 if the sum is 0.
-    """
     T, d = z.shape
     s = np.zeros(d, dtype=np.float32)
     for t in range(T):
@@ -174,7 +164,7 @@ def comparator_ftl_hindsight(z: np.ndarray, y: np.ndarray, R: float) -> np.ndarr
             s[j] += yt * float(z[t, j])
     n = _norm2(s)
     if n == 0.0:
-        return s  # zero
+        return s
     scale = R / n
     for j in range(d):
         s[j] *= scale
@@ -199,7 +189,6 @@ def simulate_SMART_like(z: np.ndarray,
     x_ftrl     = np.zeros(d, dtype=np.float32)
     switched   = False
 
-    # Precompute q_uc[t]
     q_uc_vec = np.empty(T, dtype=np.float32)
     for t in range(T):
         s = 0.0
@@ -213,10 +202,8 @@ def simulate_SMART_like(z: np.ndarray,
     for t in range(T):
         _action_ftl(theta_ftl, R, x_ftl)
         _action_ftrl(theta_ftrl, t + 1, R, eta0, x_ftrl)
-        # choose action
         x_t = x_ftl if not switched else x_ftrl
 
-        # q and q_uc
         s = 0.0
         for j in range(d):
             s += float(z[t, j]) * float(x_t[j])
@@ -225,7 +212,6 @@ def simulate_SMART_like(z: np.ndarray,
 
         total_reg += _regret_increment(q, float(y[t]), q_uc)
 
-        # gradient
         diff = q - float(y[t])
         grad_q = 0.0
         if diff > 0.0:
@@ -233,16 +219,13 @@ def simulate_SMART_like(z: np.ndarray,
         elif diff < 0.0:
             grad_q = -0.5
 
-        # update states
         for j in range(d):
             g = grad_q * float(z[t, j])
             theta_ftl[j] += g
             if switched:
                 theta_ftrl[j] += g
 
-        # SMART switch tracking
         if not switched:
-            # compute ftl_reg increment at x_ftl
             s2 = 0.0
             for j in range(d):
                 s2 += float(z[t, j]) * float(x_ftl[j])
@@ -250,7 +233,6 @@ def simulate_SMART_like(z: np.ndarray,
             ftl_reg += _regret_increment(q_ftl, float(y[t]), q_uc)
             if ftl_reg >= theta_thresh:
                 switched = True
-                # reset FTRL state
                 for j in range(d):
                     theta_ftrl[j] = 0.0
 
@@ -270,7 +252,6 @@ def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, u_comp: np.ndarray,
 # ==============================================================
 
 def _mix_seed(run_seed: int, T: int, salt: int = 0) -> np.random.Generator:
-    # Use SeedSequence to cheaply derive independent bitstreams
     ss = np.random.SeedSequence(entropy=(run_seed, T, salt, 0xA5A55A5A))
     return np.random.Generator(np.random.PCG64(ss))
 
@@ -291,6 +272,68 @@ def orthogonal_hard_sequence(T: int, R: float = 1.0):
         z[t, t] = R
     y = np.ones(T, dtype=np.float32)
     u = (np.ones(T, dtype=np.float32) / math.sqrt(T)).astype(np.float32)
+    return z, y, u
+
+
+# ==============================================================
+# Deterministic √t-gap (two leaders via blocks)
+# ==============================================================
+
+def sqrt_gap_sequence(T: int, *, d: int = 1, R: float = 1.0):
+    y_list = []
+    k = 1
+    while len(y_list) < T:
+        m = k - 1  # -1s
+        n = k     # +1s
+        for _ in range(m):
+            if len(y_list) >= T: break
+            y_list.append(-1.0)
+        for _ in range(n):
+            if len(y_list) >= T: break
+            y_list.append(1.0)
+        k += 1
+    y = np.array(y_list, dtype=np.float32)
+    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
+    u = np.zeros(d, dtype=np.float32)
+    return z, y, u
+
+
+# ==============================================================
+# NEW: Stochastic √t-gap (Bernoulli drift)
+#   P(y_t=+1) = 1/2 + c / sqrt(t), clipped to [eps, 1-eps]
+#   Expected (# +1) − (# −1) ~ Θ(√t)
+# ==============================================================
+
+def bernoulli_sqrt_gap_sequence(T: int, *, c: float = 0.25, d: int = 1, R: float = 1.0, gen: np.random.Generator | None = None):
+    if gen is None:
+        gen = np.random.default_rng(0)
+    t = np.arange(1, T + 1, dtype=np.float64)
+    p = 0.5 + c / np.sqrt(t)
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    y = (gen.random(T) < p).astype(np.float32)
+    y = 2.0 * y - 1.0  # {0,1} -> {-1,+1}
+    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
+    u = np.zeros(d, dtype=np.float32)
+    return z, y, u
+
+
+# ==============================================================
+# NEW: Two leaders (switching, no drift)
+#   Alternate fixed-length blocks of +1 and -1: +1…+1, -1…-1, +1…+1, ...
+#   No growing lead; tests adaptation to leader switches without contrived drift.
+# ==============================================================
+
+def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 1, R: float = 1.0):
+    y = np.empty(T, dtype=np.float32)
+    sign = 1.0
+    idx = 0
+    while idx < T:
+        run = min(block_len, T - idx)
+        y[idx:idx+run] = sign
+        idx += run
+        sign = -sign
+    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
+    u = np.zeros(d, dtype=np.float32)
     return z, y, u
 
 
@@ -334,32 +377,57 @@ def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int
         return z, y, u
     return sample
 
-def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):  # run_seed unused
+def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
     def sample(T: int, rep: int = 0):
         return flip_sequence(T, d=d, R=R)
+    return sample
+
+def make_sqrt_gap_two_leaders_stream(*, d: int = 1, R: float = 1.0, run_seed: int = 0):
+    def sample(T: int, rep: int = 0):
+        return sqrt_gap_sequence(T, d=d, R=R)
+    return sample
+
+def make_bernoulli_sqrt_gap_stream(*, c: float = 0.25, d: int = 1, R: float = 1.0, run_seed: int = 0):
+    def sample(T: int, rep: int = 0):
+        gen = _mix_seed(run_seed, T, 31 + rep)
+        return bernoulli_sqrt_gap_sequence(T, c=c, d=d, R=R, gen=gen)
+    return sample
+
+def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 1, R: float = 1.0, run_seed: int = 0):
+    def sample(T: int, rep: int = 0):
+        return switching_two_leaders_sequence(T, block_len=block_len, d=d, R=R)
     return sample
 
 
 # --- CASE SET (builders) ---
 CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
-    "Random i.i.d. (separable)":      lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
-    "Noisy i.i.d. (Massart 10%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
-    "Noisy i.i.d. (Massart 40%)":     lambda *, run_seed, R: make_noisy_iid_stream(p=0.40, d=5, R=R, run_seed=run_seed),
-    "Label flips (worst-case)":       lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
+    "Random i.i.d. (separable)":              lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
+    "Noisy i.i.d. (Massart 10%)":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
+    # "Noisy i.i.d. (Massart 40%)":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.40, d=5, R=R, run_seed=run_seed),
+    "Label flips (worst-case)":               lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
+    # "Two leaders (√t gap)":                   lambda *, run_seed, R: make_sqrt_gap_two_leaders_stream(d=1, R=R, run_seed=run_seed),
+    # "Stochastic √t-gap (Bernoulli drift)":    lambda *, run_seed, R: make_bernoulli_sqrt_gap_stream(c=0.25, d=1, R=R, run_seed=run_seed),
+    "Two leaders (switching, no drift)":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=1, R=R, run_seed=run_seed),
 }
 
-# Case-specific averaging controls (unchanged behavior)
+# Case-specific averaging controls
 RUNS_BY_TITLE = {
-    "Random i.i.d. (separable)":       48,
-    "Noisy i.i.d. (Massart 10%)":      48,
-    "Noisy i.i.d. (Massart 40%)":      48,
-    "Label flips (worst-case)":         1,
+    "Random i.i.d. (separable)":              48,
+    "Noisy i.i.d. (Massart 10%)":             48,
+    # "Noisy i.i.d. (Massart 40%)":             48,
+    "Label flips (worst-case)":                1,
+    # "Two leaders (√t gap)":                    1,   # deterministic
+    # "Stochastic √t-gap (Bernoulli drift)":    48,   # stochastic → average
+    "Two leaders (switching, no drift)":       1,   # deterministic
 }
 REPLICATES_BY_TITLE = {
-    "Random i.i.d. (separable)":        16,
-    "Noisy i.i.d. (Massart 10%)":      20,
-    "Noisy i.i.d. (Massart 40%)":      24,
-    "Label flips (worst-case)":         1,
+    "Random i.i.d. (separable)":              16,
+    "Noisy i.i.d. (Massart 10%)":             20,
+    # "Noisy i.i.d. (Massart 40%)":             24,
+    "Label flips (worst-case)":                1,
+    # "Two leaders (√t gap)":                    1,
+    # "Stochastic √t-gap (Bernoulli drift)":    16,
+    "Two leaders (switching, no drift)":       1,
 }
 
 
@@ -378,7 +446,6 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
         worst = 0.0
         for fam in adv_families:
             for r in range(runs):
-                # fixed adversarial families; float32
                 z, y, _ = fam(int(T), R=R)
                 u_star = comparator_ftl_hindsight(z, y, R)
                 reg_ftrl = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
@@ -417,7 +484,7 @@ def evaluate_stream_with_stats(stream_builder: Callable[..., Callable[[int, int]
         for ti, T in enumerate(t_iter):
             reps_vals = {k: [] for k in keys}
             for rep in range(replicates):
-                z, y, _ = sampler(int(T), rep=rep)  # float32
+                z, y, _ = sampler(int(T), rep=rep)
                 u_star = comparator_ftl_hindsight(z, y, R)
 
                 reps_vals["FTRL"].append(
@@ -461,11 +528,45 @@ def _plot_with_ci(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
 
 
 # ==============================================================
+# Diagnostic: visualize √t gap explicitly on the deterministic sequence
+# ==============================================================
+
+def make_sqrt_gap_diagnostic_plot(T: int, R: float = 1.0, filename: str = 'sqrt_gap_diagnostic.png'):
+    _, y, _ = sqrt_gap_sequence(T, d=1, R=R)
+
+    loss_pos = (y == -1.0).astype(np.float64)  # loss if always +1
+    loss_neg = (y ==  1.0).astype(np.float64)  # loss if always -1
+
+    cum_pos = np.cumsum(loss_pos)  # L_{+1}(t)
+    cum_neg = np.cumsum(loss_neg)  # L_{-1}(t)
+    gap     = cum_neg - cum_pos    # L_{-1}(t) - L_{+1}(t)
+
+    t = np.arange(1, T + 1, dtype=np.float64)
+    s = np.sqrt(t)
+    denom = float(np.dot(s, s))
+    c_hat = float(np.dot(gap, s) / denom) if denom > 0 else 0.0
+    fit   = c_hat * s
+
+    plt.figure(figsize=(8.0, 5.0))
+    plt.plot(t, cum_pos, label="Cumulative loss (always +1)")
+    plt.plot(t, cum_neg, label="Cumulative loss (always -1)")
+    plt.plot(t, gap,     label="Gap: L(-1) − L(+1)")
+    plt.plot(t, fit,     linestyle="--", label=f"Best-fit c·√t (c≈{c_hat:.3f})")
+    plt.title("Two leaders (√t gap): constant-expert losses and gap")
+    plt.xlabel("t")
+    plt.ylabel("Cumulative loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# ==============================================================
 # Main
 # ==============================================================
 
 if __name__ == "__main__":
-    # Experiment settings (unchanged)
+    # Experiment settings
     R        = 1.0
     T_grid   = np.arange(100, 1100, 100, dtype=int)
 
@@ -486,9 +587,16 @@ if __name__ == "__main__":
     plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
     plt.close()
 
+    # 2b) Diagnostic for the deterministic √t-gap sequence
+    make_sqrt_gap_diagnostic_plot(T=int(T_grid[-1]), R=R, filename='sqrt_gap_diagnostic.png')
+
     # 3) Evaluate across streams with per-T replicates
-    rows, cols = 2, 2
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
+    n_cases = len(CASES)
+    cols = 2
+    rows = int(math.ceil(n_cases / cols))
+    fig_width = 12
+    fig_height = 4.0 * rows
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
     axes = axes.flatten()
 
     for idx, (title, builder) in enumerate(CASES.items()):
