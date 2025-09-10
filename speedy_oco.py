@@ -266,64 +266,32 @@ def flip_sequence(T: int, d: int = 5, R: float = 1.0):
     u = np.zeros(d, dtype=np.float32)
     return z, y, u
 
-def orthogonal_hard_sequence(T: int, R: float = 1.0):
-    z = np.zeros((T, T), dtype=np.float32)
-    for t in range(T):
-        z[t, t] = R
-    y = np.ones(T, dtype=np.float32)
-    u = (np.ones(T, dtype=np.float32) / math.sqrt(T)).astype(np.float32)
-    return z, y, u
 
 
-# ==============================================================
-# Deterministic √t-gap (two leaders via blocks)
-# ==============================================================
+def make_random_labels_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
+    gen_u = _mix_seed(run_seed, 0, 11)
+    u = gen_u.standard_normal(d).astype(np.float32)
+    n = float(np.linalg.norm(u))
+    if n > 0:
+        u /= n
 
-def sqrt_gap_sequence(T: int, *, d: int = 1, R: float = 1.0):
-    y_list = []
-    k = 1
-    while len(y_list) < T:
-        m = k - 1  # -1s
-        n = k     # +1s
-        for _ in range(m):
-            if len(y_list) >= T: break
-            y_list.append(-1.0)
-        for _ in range(n):
-            if len(y_list) >= T: break
-            y_list.append(1.0)
-        k += 1
-    y = np.array(y_list, dtype=np.float32)
-    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
-    u = np.zeros(d, dtype=np.float32)
-    return z, y, u
-
+    def sample(T: int, rep: int = 0):
+        gen = _mix_seed(run_seed, T, 13 + rep)
+        z = gen.standard_normal((T, d)).astype(np.float32)
+        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32)
+        norms = np.maximum(norms, 1.0)
+        z = z / norms * R
+        y = gen.choice([-1.0, 1.0], size=T).astype(np.float32)
+        return z, y, u
+    return sample
 
 # ==============================================================
-# NEW: Stochastic √t-gap (Bernoulli drift)
-#   P(y_t=+1) = 1/2 + c / sqrt(t), clipped to [eps, 1-eps]
-#   Expected (# +1) − (# −1) ~ Θ(√t)
-# ==============================================================
-
-def bernoulli_sqrt_gap_sequence(T: int, *, c: float = 0.25, d: int = 1, R: float = 1.0, gen: np.random.Generator | None = None):
-    if gen is None:
-        gen = np.random.default_rng(0)
-    t = np.arange(1, T + 1, dtype=np.float64)
-    p = 0.5 + c / np.sqrt(t)
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-    y = (gen.random(T) < p).astype(np.float32)
-    y = 2.0 * y - 1.0  # {0,1} -> {-1,+1}
-    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
-    u = np.zeros(d, dtype=np.float32)
-    return z, y, u
-
-
-# ==============================================================
-# NEW: Two leaders (switching, no drift)
+# Two leaders (switching, no drift)
 #   Alternate fixed-length blocks of +1 and -1: +1…+1, -1…-1, +1…+1, ...
 #   No growing lead; tests adaptation to leader switches without contrived drift.
 # ==============================================================
 
-def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 1, R: float = 1.0):
+def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5, R: float = 1.0):
     y = np.empty(T, dtype=np.float32)
     sign = 1.0
     idx = 0
@@ -382,18 +350,7 @@ def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
         return flip_sequence(T, d=d, R=R)
     return sample
 
-def make_sqrt_gap_two_leaders_stream(*, d: int = 1, R: float = 1.0, run_seed: int = 0):
-    def sample(T: int, rep: int = 0):
-        return sqrt_gap_sequence(T, d=d, R=R)
-    return sample
-
-def make_bernoulli_sqrt_gap_stream(*, c: float = 0.25, d: int = 1, R: float = 1.0, run_seed: int = 0):
-    def sample(T: int, rep: int = 0):
-        gen = _mix_seed(run_seed, T, 31 + rep)
-        return bernoulli_sqrt_gap_sequence(T, c=c, d=d, R=R, gen=gen)
-    return sample
-
-def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 1, R: float = 1.0, run_seed: int = 0):
+def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 5, R: float = 1.0, run_seed: int = 0):
     def sample(T: int, rep: int = 0):
         return switching_two_leaders_sequence(T, block_len=block_len, d=d, R=R)
     return sample
@@ -403,30 +360,21 @@ def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 1, R: flo
 CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
     "Random i.i.d. (separable)":              lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
     "Noisy i.i.d. (Massart 10%)":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
-    # "Noisy i.i.d. (Massart 40%)":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.40, d=5, R=R, run_seed=run_seed),
     "Label flips (worst-case)":               lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
-    # "Two leaders (√t gap)":                   lambda *, run_seed, R: make_sqrt_gap_two_leaders_stream(d=1, R=R, run_seed=run_seed),
-    # "Stochastic √t-gap (Bernoulli drift)":    lambda *, run_seed, R: make_bernoulli_sqrt_gap_stream(c=0.25, d=1, R=R, run_seed=run_seed),
-    "Two leaders (switching, no drift)":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=1, R=R, run_seed=run_seed),
+    "Two leaders (switching, no drift)":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=5, R=R, run_seed=run_seed),
 }
 
 # Case-specific averaging controls
 RUNS_BY_TITLE = {
     "Random i.i.d. (separable)":              48,
     "Noisy i.i.d. (Massart 10%)":             48,
-    # "Noisy i.i.d. (Massart 40%)":             48,
     "Label flips (worst-case)":                1,
-    # "Two leaders (√t gap)":                    1,   # deterministic
-    # "Stochastic √t-gap (Bernoulli drift)":    48,   # stochastic → average
     "Two leaders (switching, no drift)":       1,   # deterministic
 }
 REPLICATES_BY_TITLE = {
     "Random i.i.d. (separable)":              16,
     "Noisy i.i.d. (Massart 10%)":             20,
-    # "Noisy i.i.d. (Massart 40%)":             24,
     "Label flips (worst-case)":                1,
-    # "Two leaders (√t gap)":                    1,
-    # "Stochastic √t-gap (Bernoulli drift)":    16,
     "Two leaders (switching, no drift)":       1,
 }
 
@@ -440,17 +388,16 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
                                     runs: int = 5,
                                     R: float = 1.0,
                                     base_seed: int = 0) -> Dict[int, float]:
-    adv_families = [flip_sequence, orthogonal_hard_sequence]
     g_emp: Dict[int, float] = {}
     for T in tqdm(T_grid, desc="Estimating g(T) across adversarial families"):
         worst = 0.0
-        for fam in adv_families:
-            for r in range(runs):
-                z, y, _ = fam(int(T), R=R)
-                u_star = comparator_ftl_hindsight(z, y, R)
-                reg_ftrl = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
-                if reg_ftrl > worst:
-                    worst = reg_ftrl
+        for r in range(runs):
+            sampler = make_random_labels_stream(d=5, R=R, run_seed=base_seed + r)
+            z, y, _ = sampler(int(T), rep=0)
+            u_star = comparator_ftl_hindsight(z, y, R)
+            reg_ftrl = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
+            if reg_ftrl > worst:
+                worst = reg_ftrl
         g_emp[int(T)] = worst
     return g_emp
 
@@ -528,40 +475,6 @@ def _plot_with_ci(ax, x, mean: np.ndarray, ci: np.ndarray, label: str):
 
 
 # ==============================================================
-# Diagnostic: visualize √t gap explicitly on the deterministic sequence
-# ==============================================================
-
-def make_sqrt_gap_diagnostic_plot(T: int, R: float = 1.0, filename: str = 'sqrt_gap_diagnostic.png'):
-    _, y, _ = sqrt_gap_sequence(T, d=1, R=R)
-
-    loss_pos = (y == -1.0).astype(np.float64)  # loss if always +1
-    loss_neg = (y ==  1.0).astype(np.float64)  # loss if always -1
-
-    cum_pos = np.cumsum(loss_pos)  # L_{+1}(t)
-    cum_neg = np.cumsum(loss_neg)  # L_{-1}(t)
-    gap     = cum_neg - cum_pos    # L_{-1}(t) - L_{+1}(t)
-
-    t = np.arange(1, T + 1, dtype=np.float64)
-    s = np.sqrt(t)
-    denom = float(np.dot(s, s))
-    c_hat = float(np.dot(gap, s) / denom) if denom > 0 else 0.0
-    fit   = c_hat * s
-
-    plt.figure(figsize=(8.0, 5.0))
-    plt.plot(t, cum_pos, label="Cumulative loss (always +1)")
-    plt.plot(t, cum_neg, label="Cumulative loss (always -1)")
-    plt.plot(t, gap,     label="Gap: L(-1) − L(+1)")
-    plt.plot(t, fit,     linestyle="--", label=f"Best-fit c·√t (c≈{c_hat:.3f})")
-    plt.title("Two leaders (√t gap): constant-expert losses and gap")
-    plt.xlabel("t")
-    plt.ylabel("Cumulative loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-# ==============================================================
 # Main
 # ==============================================================
 
@@ -571,7 +484,7 @@ if __name__ == "__main__":
     T_grid   = np.arange(100, 1100, 100, dtype=int)
 
     # 1) Empirically estimate g(T) from FTRL on adversarial families (near-minimax)
-    g_emp = empirical_worst_case_thresholds(T_grid, runs=5, R=R)
+    g_emp = empirical_worst_case_thresholds(T_grid, runs=100, R=R)
 
     # 2) Plot empirical g(T) vs theoretical sqrt(2T)
     plt.figure(figsize=(7.5, 5.0))
@@ -586,9 +499,6 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
     plt.close()
-
-    # 2b) Diagnostic for the deterministic √t-gap sequence
-    make_sqrt_gap_diagnostic_plot(T=int(T_grid[-1]), R=R, filename='sqrt_gap_diagnostic.png')
 
     # 3) Evaluate across streams with per-T replicates
     n_cases = len(CASES)
