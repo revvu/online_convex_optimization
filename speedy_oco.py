@@ -266,25 +266,6 @@ def flip_sequence(T: int, d: int = 5, R: float = 1.0):
     u = np.zeros(d, dtype=np.float32)
     return z, y, u
 
-
-
-def make_random_labels_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
-    gen_u = _mix_seed(run_seed, 0, 11)
-    u = gen_u.standard_normal(d).astype(np.float32)
-    n = float(np.linalg.norm(u))
-    if n > 0:
-        u /= n
-
-    def sample(T: int, rep: int = 0):
-        gen = _mix_seed(run_seed, T, 13 + rep)
-        z = gen.standard_normal((T, d)).astype(np.float32)
-        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32)
-        norms = np.maximum(norms, 1.0)
-        z = z / norms * R
-        y = gen.choice([-1.0, 1.0], size=T).astype(np.float32)
-        return z, y, u
-    return sample
-
 # ==============================================================
 # Two leaders (switching, no drift)
 #   Alternate fixed-length blocks of +1 and -1: +1…+1, -1…-1, +1…+1, ...
@@ -359,28 +340,28 @@ def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 5, R: flo
 # --- CASE SET (builders) ---
 CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
     "Random i.i.d. (separable)":              lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
-    "Noisy i.i.d. (Massart 10%)":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
-    "Label flips (worst-case)":               lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
-    "Two leaders (switching, no drift)":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=5, R=R, run_seed=run_seed),
+    "Massart noise 10%":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
+    "Label flips":               lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
+    "Switching leaders":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=5, R=R, run_seed=run_seed),
 }
 
 # Case-specific averaging controls
 RUNS_BY_TITLE = {
     "Random i.i.d. (separable)":              48,
-    "Noisy i.i.d. (Massart 10%)":             48,
-    "Label flips (worst-case)":                1,
-    "Two leaders (switching, no drift)":       1,   # deterministic
+    "Massart noise 10%":             48,
+    "Label flips":                1,
+    "Switching leaders":       1,   # deterministic
 }
 REPLICATES_BY_TITLE = {
     "Random i.i.d. (separable)":              16,
-    "Noisy i.i.d. (Massart 10%)":             20,
-    "Label flips (worst-case)":                1,
-    "Two leaders (switching, no drift)":       1,
+    "Massart noise 10%":             20,
+    "Label flips":                1,
+    "Switching leaders":       1,
 }
 
 
 # ==============================================================
-# Empirical g(T) from the worst-case (near-minimax) backup alg.
+# Empirical g(T) for random sequences (random z, random y)
 # ==============================================================
 
 def empirical_worst_case_thresholds(T_grid: np.ndarray,
@@ -388,17 +369,23 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
                                     runs: int = 5,
                                     R: float = 1.0,
                                     base_seed: int = 0) -> Dict[int, float]:
+    # For each T, sample `runs` i.i.d. random sequences (z, y) and
+    # take the maximum FTRL regret against the best fixed comparator.
     g_emp: Dict[int, float] = {}
-    for T in tqdm(T_grid, desc="Estimating g(T) across adversarial families"):
-        worst = 0.0
+    for T in tqdm(T_grid, desc="Estimating g(T) on random sequences"):
+        max_regret = 0.0
         for r in range(runs):
-            sampler = make_random_labels_stream(d=5, R=R, run_seed=base_seed + r)
-            z, y, _ = sampler(int(T), rep=0)
+            gen = _mix_seed(base_seed + r, int(T), 13 + r)
+            z = gen.standard_normal((int(T), 5)).astype(np.float32)
+            norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32)
+            norms = np.maximum(norms, 1.0)
+            z = z / norms * R
+            y = gen.choice([-1.0, 1.0], size=int(T)).astype(np.float32)
             u_star = comparator_ftl_hindsight(z, y, R)
-            reg_ftrl = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
-            if reg_ftrl > worst:
-                worst = reg_ftrl
-        g_emp[int(T)] = worst
+            reg = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
+            if reg > max_regret:
+                max_regret = reg
+        g_emp[int(T)] = max_regret
     return g_emp
 
 # ==============================================================
@@ -484,20 +471,22 @@ if __name__ == "__main__":
     T_grid   = np.arange(100, 1100, 100, dtype=int)
 
     # 1) Empirically estimate g(T) from FTRL on adversarial families (near-minimax)
-    g_emp = empirical_worst_case_thresholds(T_grid, runs=100, R=R)
+    g_emp = empirical_worst_case_thresholds(T_grid, runs=1000, R=R)
 
     # 2) Plot empirical g(T) vs theoretical sqrt(2T)
     plt.figure(figsize=(7.5, 5.0))
     g_vals = [g_emp[int(T)] for T in T_grid]
     theory = [math.sqrt(2 * int(T)) for T in T_grid]
-    plt.plot(T_grid, g_vals,  marker="o", label="Empirical g(T) from FTRL (worst-case families)")
-    plt.plot(T_grid, theory,  marker="x", label=r"Theory $\sqrt{2T}$ (scale comparator)")
-    plt.title("Empirical worst-case g(T) for SMART (ALG_WC = FTRL)")
-    plt.xlabel("T rounds")
-    plt.ylabel("g(T)")
-    plt.legend()
+    theory_pi = [math.sqrt(int(T) / (math.pi)) for T in T_grid]
+    plt.plot(T_grid, g_vals,  marker="o", label="Empirical g(T)")
+    plt.plot(T_grid, theory_pi, linestyle='--', label=r"$\sqrt{T/\pi}$")
+    plt.plot(T_grid, theory,  marker="x", label=r"$\sqrt{2T}$")
+    plt.title("Empirical worst-case g(T) for SMART (ALG_WC = FTRL)", fontsize=18)
+    plt.xlabel("T rounds", fontsize=16)
+    plt.ylabel("g(T)", fontsize=16)
+    plt.legend(prop={'size': 14})
     plt.tight_layout()
-    plt.savefig('empirical_g_T.png', dpi=300, bbox_inches='tight')
+    plt.savefig('empirical_g_T.png', dpi=600, bbox_inches='tight')
     plt.close()
 
     # 3) Evaluate across streams with per-T replicates
@@ -520,17 +509,17 @@ if __name__ == "__main__":
         _plot_with_ci(ax, T_grid, *stats["FTRL"], label="FTRL")
         _plot_with_ci(ax, T_grid, *stats["FTL"],  label="FTL")
         _plot_with_ci(ax, T_grid, *stats["SMART"], label="SMART (√2T)")
-        _plot_with_ci(ax, T_grid, *stats["EMP"],   label="SMART (empirical g from FTRL)")
+        _plot_with_ci(ax, T_grid, *stats["EMP"],   label="SMART (empirical g)")
 
-        ax.set_title(f"{title} (runs={runs}, reps/T={replicates})", fontsize=10)
-        ax.set_xlabel("T rounds")
-        ax.set_ylabel("Cumulative regret")
-        ax.legend()
+        ax.set_title(f"{title} (runs={runs}, reps/T={replicates})", fontsize=16)
+        ax.set_xlabel("T rounds", fontsize=14)
+        ax.set_ylabel("Cumulative regret", fontsize=14)
+        ax.legend(prop={'size': 12})
 
     for j in range(len(CASES), rows * cols):
         axes[j].axis('off')
 
-    fig.suptitle("Mean cumulative regret ± 95% CI", fontsize=14)
+    fig.suptitle("Online Linear Binary Classification", fontsize=20)
     fig.tight_layout()
-    plt.savefig('algorithm_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('algorithm_comparison.png', dpi=600, bbox_inches='tight')
     plt.close()
