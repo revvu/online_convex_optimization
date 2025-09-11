@@ -7,7 +7,6 @@ This module contains implementations of various online learning algorithms:
 - SMART (Switching algorithm)
 - Supporting utilities and comparators
 
-Speed-optimized with Numba JIT compilation for performance.
 """
 
 from __future__ import annotations
@@ -16,81 +15,27 @@ import math
 from typing import Dict
 
 import numpy as np
-
-# ------------------------ Acceleration toggles ------------------------
-USE_NUMBA = True  # set False to disable JIT
-NUMBA_THREADS = None  # e.g., set to an int to control threads
-
-try:
-    if USE_NUMBA:
-        from numba import njit, prange, set_num_threads
-        if NUMBA_THREADS is not None:
-            set_num_threads(NUMBA_THREADS)
-    else:
-        raise ImportError
-except Exception:
-    # Fallback: define no-op decorators
-    def njit(*args, **kwargs):
-        def deco(f): return f
-        return deco
-    def prange(x): return range(x)
+from tqdm import tqdm
 
 
-# ==============================================================
-# Utilities (Numba-friendly)
-# ==============================================================
-
-@njit(cache=True, fastmath=True)
-def _clip_unit_scalar(q: float) -> float:
-    if q > 1.0:
-        return 1.0
-    if q < -1.0:
-        return -1.0
-    return q
-
-@njit(cache=True, fastmath=True)
-def _norm2(x: np.ndarray) -> float:
-    s = 0.0
-    for i in range(x.size):
-        s += float(x[i]) * float(x[i])
-    return math.sqrt(s)
-
-@njit(cache=True, fastmath=True)
 def _project_to_ball(x: np.ndarray, R: float) -> None:
-    n = _norm2(x)
+    n = np.linalg.norm(x)
     if n > R and n > 0.0:
-        scale = R / n
-        for i in range(x.size):
-            x[i] *= scale
+        x *= R / n
 
-@njit(cache=True, fastmath=True)
 def _normalized_hinge(q: float, y: float) -> float:
-    # y in {±1}, q ∈ [-1,1]; equals 0 if correct sign at ±1, 1 if wrong sign at ∓1
-    diff = q - y
-    if diff < 0:
-        diff = -diff
-    return 0.5 * diff
+    # y in {1, -1}, q in [-1,1]; normalized hinge loss
+    return 0.5 * abs(q - y)
 
-@njit(cache=True, fastmath=True)
-def _regret_increment(q_pred: float, y_true: float, q_comp: float) -> float:
-    return _normalized_hinge(q_pred, y_true) - _normalized_hinge(q_comp, y_true)
-
-@njit(cache=True, fastmath=True)
 def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
-    n = _norm2(theta)
-    if n == 0.0:
-        for i in range(theta.size):
-            out[i] = 0.0
-    else:
-        s = -R / n
-        for i in range(theta.size):
-            out[i] = s * theta[i]
-
-@njit(cache=True, fastmath=True)
-def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarray) -> None:
-    eta_t = eta0 / math.sqrt(float(max(1, t)))
+    n = np.linalg.norm(theta)
+    s = 0.0 if n == 0.0 else -R / n
     for i in range(theta.size):
-        out[i] = -eta_t * theta[i]
+        out[i] = s * theta[i]
+
+def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarray) -> None:
+    eta_t = eta0 / math.sqrt(max(1.0, float(t)))
+    out[:] = -eta_t * theta
     _project_to_ball(out, R)
 
 
@@ -98,7 +43,6 @@ def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarr
 # Online simulation (FTL, FTRL), regret vs comparator
 # ==============================================================
 
-@njit(cache=True, fastmath=True)
 def simulate_alg(z: np.ndarray,
                  y: np.ndarray,
                  u_comp: np.ndarray,
@@ -107,130 +51,147 @@ def simulate_alg(z: np.ndarray,
                  eta0: float) -> float:
     T, d = z.shape
     theta = np.zeros(d, dtype=np.float32)
-    x_t   = np.zeros(d, dtype=np.float32)
+    x_t = np.zeros(d, dtype=np.float32)
+    cum_loss = 0.0
 
-    # Precompute q_uc[t] = clip(z[t]·u_comp)
-    q_uc_vec = np.empty(T, dtype=np.float32)
-    for t in range(T):
-        s = 0.0
-        for j in range(d):
-            s += float(z[t, j]) * float(u_comp[j])
-        q_uc_vec[t] = _clip_unit_scalar(s)
-
-    cum_reg = 0.0
     for t in range(T):
         if alg_flag == 0:
             _action_ftrl(theta, t + 1, R, eta0, x_t)
         else:
             _action_ftl(theta, R, x_t)
 
-        s = 0.0
-        for j in range(d):
-            s += float(z[t, j]) * float(x_t[j])
-        q = _clip_unit_scalar(s)
+        q = np.clip(np.dot(z[t], x_t), -1.0, 1.0)
+        y_t = float(y[t])
+        cum_loss += _normalized_hinge(q, y_t)
 
-        cum_reg += _regret_increment(q, float(y[t]), float(q_uc_vec[t]))
+        diff = q - y_t
+        grad_q = 0.5 if diff > 0.0 else -0.5 if diff < 0.0 else 0.0
+        theta += grad_q * z[t]
 
-        diff = q - float(y[t])
-        grad_q = 0.0
-        if diff > 0.0:
-            grad_q = 0.5
-        elif diff < 0.0:
-            grad_q = -0.5
-
-        for j in range(d):
-            theta[j] += grad_q * float(z[t, j])
-
-    return cum_reg
+    # Calculate comparator loss using comparator_ftl_hindsight
+    _, comp_loss = comparator_ftl_hindsight(z, y, R)
+    
+    # Return regret (algorithm loss - comparator loss)
+    return cum_loss - comp_loss
 
 
 # ==============================================================
 # Hindsight comparator: best fixed linear predictor
 # ==============================================================
 
-@njit(cache=True, fastmath=True)
-def comparator_ftl_hindsight(z: np.ndarray, y: np.ndarray, R: float) -> np.ndarray:
+def comparator_ftl_hindsight(z: np.ndarray, y: np.ndarray, R: float) -> tuple[np.ndarray, float]:
     T, d = z.shape
-    s = np.zeros(d, dtype=np.float32)
-    for t in range(T):
-        yt = float(y[t])
-        for j in range(d):
-            s[j] += yt * float(z[t, j])
-    n = _norm2(s)
-    if n == 0.0:
-        return s
-    scale = R / n
-    for j in range(d):
-        s[j] *= scale
-    return s
+    # Vectorized computation: s = sum(y[t] * z[t] for t in range(T))
+    s = np.sum(y[:, np.newaxis] * z, axis=0).astype(np.float32)
+    n = np.linalg.norm(s)
+    if n > 0.0:
+        s *= R / n
+    
+    # Calculate cumulative loss of playing strategy s throughout the sequence
+    # Vectorized computation for speed
+    q_all = np.clip(z @ s, -1.0, 1.0)  # All dot products at once
+    cum_loss = np.sum(0.5 * np.abs(q_all - y))  # Vectorized loss calculation
+    
+    return s, cum_loss
 
 
 # ==============================================================
 # SMART (single switch) with proper reset of ALG_WC
 # ==============================================================
 
-@njit(cache=True, fastmath=True)
+
+def _compute_gradient(q_pred: float, y_true: float) -> float:
+    """Compute gradient for normalized hinge loss."""
+    diff = q_pred - y_true
+    return 0.5 if diff > 0.0 else -0.5 if diff < 0.0 else 0.0
+
+def _comparator_loss_up_to_t(z: np.ndarray, y: np.ndarray, R: float, t: int) -> float:
+    """Compute comparator loss up to time t (inclusive)."""
+    if t == 0:
+        return 0.0
+    
+    # Compute best fixed strategy up to time t
+    s = np.sum(y[:t+1, np.newaxis] * z[:t+1], axis=0).astype(np.float32)
+    n = np.linalg.norm(s)
+    if n > 0.0:
+        s *= R / n
+    
+    # Compute cumulative loss of strategy s up to time t
+    q_all = np.clip(z[:t+1] @ s, -1.0, 1.0)
+    return np.sum(0.5 * np.abs(q_all - y[:t+1]))
+
 def simulate_SMART_like(z: np.ndarray,
                         y: np.ndarray,
                         u_comp: np.ndarray,
                         theta_thresh: float,
                         R: float,
                         eta0: float) -> float:
+    """
+    Simulate SMART-like algorithm with single switch from FTL to FTRL.
+    
+    The algorithm starts with FTL and switches to FTRL when FTL loss
+    exceeds the threshold. After switching, FTRL parameters are reset.
+    """
     T, d = z.shape
-    theta_ftl  = np.zeros(d, dtype=np.float32)
-    theta_ftrl = np.zeros(d, dtype=np.float32)
-    x_ftl      = np.zeros(d, dtype=np.float32)
-    x_ftrl     = np.zeros(d, dtype=np.float32)
-    switched   = False
-
-    q_uc_vec = np.empty(T, dtype=np.float32)
+    
+    # Initialize algorithm parameters
+    theta_ftl = np.zeros(d, dtype=np.float32)   # FTL parameter vector
+    theta_ftrl = np.zeros(d, dtype=np.float32)  # FTRL parameter vector
+    x_ftl = np.zeros(d, dtype=np.float32)       # FTL action vector
+    x_ftrl = np.zeros(d, dtype=np.float32)      # FTRL action vector
+    has_switched = False                        # Switch flag
+    
+    # Initialize loss tracking
+    ftl_loss = 0.0
+    total_loss = 0.0
+    comp_loss_so_far = 0.0  # Comparator loss up to current time
+    
+    # Main algorithm loop
     for t in range(T):
-        s = 0.0
-        for j in range(d):
-            s += float(z[t, j]) * float(u_comp[j])
-        q_uc_vec[t] = _clip_unit_scalar(s)
-
-    ftl_reg    = 0.0
-    total_reg  = 0.0
-
-    for t in range(T):
+        # Compute actions for both algorithms
         _action_ftl(theta_ftl, R, x_ftl)
         _action_ftrl(theta_ftrl, t + 1, R, eta0, x_ftrl)
-        x_t = x_ftl if not switched else x_ftrl
-
-        s = 0.0
-        for j in range(d):
-            s += float(z[t, j]) * float(x_t[j])
-        q    = _clip_unit_scalar(s)
-        q_uc = float(q_uc_vec[t])
-
-        total_reg += _regret_increment(q, float(y[t]), q_uc)
-
-        diff = q - float(y[t])
-        grad_q = 0.0
-        if diff > 0.0:
-            grad_q = 0.5
-        elif diff < 0.0:
-            grad_q = -0.5
-
-        for j in range(d):
-            g = grad_q * float(z[t, j])
-            theta_ftl[j] += g
-            if switched:
-                theta_ftrl[j] += g
-
-        if not switched:
-            s2 = 0.0
-            for j in range(d):
-                s2 += float(z[t, j]) * float(x_ftl[j])
-            q_ftl = _clip_unit_scalar(s2)
-            ftl_reg += _regret_increment(q_ftl, float(y[t]), q_uc)
-            if ftl_reg >= theta_thresh:
-                switched = True
-                for j in range(d):
-                    theta_ftrl[j] = 0.0
-
-    return total_reg
+        
+        # Select action based on switch status
+        current_action = x_ftl if not has_switched else x_ftrl
+        
+        # Compute prediction and loss
+        prediction_dot = np.dot(z[t], current_action)
+        prediction = np.clip(prediction_dot, -1.0, 1.0)
+        
+        total_loss += _normalized_hinge(prediction, float(y[t]))
+        
+        # Compute gradient and update parameters
+        gradient = _compute_gradient(prediction, float(y[t]))
+        
+        # Vectorized gradient update
+        gradient_vector = gradient * z[t]
+        theta_ftl += gradient_vector
+        if has_switched:
+            theta_ftrl += gradient_vector
+        
+        # Check for switch condition (only if not already switched)
+        if not has_switched:
+            # Compute FTL prediction for loss calculation
+            ftl_dot = np.dot(z[t], x_ftl)
+            ftl_prediction = np.clip(ftl_dot, -1.0, 1.0)
+            ftl_loss += _normalized_hinge(ftl_prediction, float(y[t]))
+            
+            # Compute comparator loss up to time t
+            comp_loss_so_far = _comparator_loss_up_to_t(z, y, R, t)
+            
+            # Switch to FTRL if FTL regret exceeds threshold
+            ftl_regret = ftl_loss - comp_loss_so_far
+            if ftl_regret >= theta_thresh:
+                has_switched = True
+                # Reset FTRL parameters after switch
+                theta_ftrl.fill(0.0)
+    
+    # Calculate final comparator loss for return value
+    _, final_comp_loss = comparator_ftl_hindsight(z, y, R)
+    
+    # Return regret (algorithm loss - comparator loss)
+    return total_loss - final_comp_loss
 
 
 def simulate_SMART(z: np.ndarray, y: np.ndarray, u_comp: np.ndarray, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
@@ -252,7 +213,6 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
                                     base_seed: int = 0) -> Dict[int, float]:
     # For each T, sample `runs` i.i.d. random sequences (z, y) and
     # take the maximum FTRL regret against the best fixed comparator.
-    from tqdm import tqdm
     
     g_emp: Dict[int, float] = {}
     for T in tqdm(T_grid, desc="Estimating g(T) on random sequences"):
@@ -264,7 +224,7 @@ def empirical_worst_case_thresholds(T_grid: np.ndarray,
             norms = np.maximum(norms, 1.0)
             z = z / norms * R
             y = gen.choice([-1.0, 1.0], size=int(T)).astype(np.float32)
-            u_star = comparator_ftl_hindsight(z, y, R)
+            u_star, _ = comparator_ftl_hindsight(z, y, R)
             reg = simulate_alg(z, y, u_star, alg_flag=0, R=R, eta0=math.sqrt(2))
             if reg > max_regret:
                 max_regret = reg
