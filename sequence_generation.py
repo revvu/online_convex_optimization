@@ -14,7 +14,7 @@ and stream builders for online learning experiments:
 from __future__ import annotations
 from typing import Callable, Dict, Tuple
 import numpy as np
-from algorithms import _mix_seed
+from algorithms import _rng
 
 
 # ==============================================================
@@ -52,36 +52,38 @@ def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5, R
 # ==============================================================
 
 def make_random_iid_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
-    gen_u = _mix_seed(run_seed, 0, 11)
-    u = gen_u.standard_normal(d).astype(np.float32)
+    gen_u = _rng(run_seed, 0, 11)
+    u = gen_u.standard_normal(d).astype(np.float32, copy=False)
     n = float(np.linalg.norm(u))
     if n > 0:
         u /= n
 
     def sample(T: int, rep: int = 0):
-        gen = _mix_seed(run_seed, T, 13 + rep)
-        z = gen.standard_normal((T, d)).astype(np.float32)
-        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32)
-        norms = np.maximum(norms, 1.0)
-        z = z / norms * R
-        y = np.sign(z @ u).astype(np.float32); y[y == 0.0] = 1.0
+        gen = _rng(run_seed, T, 13 + rep)
+        z = gen.standard_normal((T, d)).astype(np.float32, copy=False)
+        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32, copy=False)
+        np.maximum(norms, 1.0, out=norms)
+        z *= (R / norms)
+        y = np.sign(z @ u).astype(np.float32, copy=False)
+        y[y == 0.0] = 1.0
         return z, y, u
     return sample
 
 def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int = 0):
-    gen_u = _mix_seed(run_seed, 0, 21)
-    u = gen_u.standard_normal(d).astype(np.float32)
+    gen_u = _rng(run_seed, 0, 21)
+    u = gen_u.standard_normal(d).astype(np.float32, copy=False)
     n = float(np.linalg.norm(u))
     if n > 0:
         u /= n
 
     def sample(T: int, rep: int = 0):
-        gen = _mix_seed(run_seed, T, 23 + rep)
-        z = gen.standard_normal((T, d)).astype(np.float32)
-        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32)
-        norms = np.maximum(norms, 1.0)
-        z = z / norms * R
-        y = np.sign(z @ u).astype(np.float32); y[y == 0.0] = 1.0
+        gen = _rng(run_seed, T, 23 + rep)
+        z = gen.standard_normal((T, d)).astype(np.float32, copy=False)
+        norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32, copy=False)
+        np.maximum(norms, 1.0, out=norms)
+        z *= (R / norms)
+        y = np.sign(z @ u).astype(np.float32, copy=False)
+        y[y == 0.0] = 1.0
         flips = gen.random(T) < p
         y[flips] *= -1.0
         return z, y, u
