@@ -110,14 +110,14 @@ CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray
 
 # Case-specific averaging controls
 RUNS_BY_TITLE = {
-    "Random i.i.d. (separable)":              48,
-    "Massart noise 10%":             48,
+    "Random i.i.d. (separable)":              8,
+    "Massart noise 10%":             8,
     "Label flips":                1,
     "Switching leaders":       1,   # deterministic
 }
 REPLICATES_BY_TITLE = {
-    "Random i.i.d. (separable)":              16,
-    "Massart noise 10%":             20,
+    "Random i.i.d. (separable)":              2,
+    "Massart noise 10%":             2,
     "Label flips":                1,
     "Switching leaders":       1,
 }
