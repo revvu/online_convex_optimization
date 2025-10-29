@@ -6,69 +6,42 @@ from typing import Literal, Optional, Tuple
 
 import numpy as np
 
-# Optional fast path: tiny kernels to match fast_algorithms.py style
-try:
-    from numba import njit
-    _HAS_NUMBA = True
-except Exception:
-    _HAS_NUMBA = False
-
-# Optional dependency for exact convex solves
-try:
-    import cvxpy as cp  # type: ignore
-    _HAS_CVXPY = True
-except Exception:
-    _HAS_CVXPY = False
-
+from numba import njit
+import cvxpy as cp  # type: ignore
 
 # ==============================================================
 # Small JIT helpers (mirrors fast_algorithms.py style)
 # ==============================================================
 
-if _HAS_NUMBA:
-    @njit(cache=True)
-    def _dot(a: np.ndarray, b: np.ndarray) -> float:
-        total = 0.0
-        for i in range(a.shape[0]):
-            total += a[i] * b[i]
-        return total
+@njit(cache=True)
+def _dot(a: np.ndarray, b: np.ndarray) -> float:
+    total = 0.0
+    for i in range(a.shape[0]):
+        total += a[i] * b[i]
+    return total
 
-    @njit(cache=True)
-    def _normalized_hinge(q: float, y: float) -> float:
-        diff = q - y
-        if diff < 0.0:
-            diff = -diff
-        return 0.5 * diff
+@njit(cache=True)
+def _normalized_hinge(q: float, y: float) -> float:
+    diff = q - y
+    if diff < 0.0:
+        diff = -diff
+    return 0.5 * diff
 
-    @njit(cache=True)
-    def _grad_normalized_hinge(q: float, y: float) -> float:
-        diff = q - y
-        if diff > 0.0:
-            return 0.5
-        if diff < 0.0:
-            return -0.5
-        return 0.0
+@njit(cache=True)
+def _grad_normalized_hinge(q: float, y: float) -> float:
+    diff = q - y
+    if diff > 0.0:
+        return 0.5
+    if diff < 0.0:
+        return -0.5
+    return 0.0
 
-    @njit(cache=True)
-    def _vec_norm2(x: np.ndarray) -> float:
-        s = 0.0
-        for i in range(x.shape[0]):
-            s += x[i] * x[i]
-        return math.sqrt(s)
-
-else:
-    def _dot(a: np.ndarray, b: np.ndarray) -> float:
-        return float(np.dot(a, b))
-
-    def _normalized_hinge(q: float, y: float) -> float:
-        return 0.5 * abs(q - y)
-
-    def _grad_normalized_hinge(q: float, y: float) -> float:
-        diff = q - y
-        return 0.5 if diff > 0 else (-0.5 if diff < 0 else 0.0)
-
+@njit(cache=True)
 def _vec_norm2(x: np.ndarray) -> float:
-    return float(np.linalg.norm(x))
+    s = 0.0
+    for i in range(x.shape[0]):
+        s += x[i] * x[i]
+    return math.sqrt(s)
 
 
 # --------------------------------------------------------------
@@ -85,13 +58,6 @@ def _ensure_float64_contiguous(arr: np.ndarray) -> np.ndarray:
 # Exact FTL (no clip): single reusable CVXPY problem
 # ==============================================================
 
-def _require_cvxpy() -> None:
-    if not _HAS_CVXPY:
-        raise RuntimeError(
-            "Exact FTL requires cvxpy. Install via `pip install cvxpy`.\n"
-            "Use ECOS/MOSEK/GUROBI for best performance."
-        )
-
 class ExactFTLNoClip:
     """
     Build once, solve many: exact FTL (no clip) with a norm-ball constraint.
@@ -107,7 +73,6 @@ class ExactFTLNoClip:
         solver: Optional[str] = None,
         solver_opts: Optional[dict] = None,
     ) -> None:
-        _require_cvxpy()
         self.d = int(d)
         self.T_max = int(T_max)
         self.R = float(R)
