@@ -40,7 +40,6 @@ CI_Z = 1.96  # 95% normal CI
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    R: float = 1.0
     T_grid: IntArray = field(default_factory=lambda: np.arange(100, 1100, 100, dtype=np.int64))
     base_seed: int = 0
     g_runs: int = 200  # fewer runs than fast driver; each call solves a convex program
@@ -66,7 +65,6 @@ def empirical_worst_case_thresholds(
     T_grid: IntArray,
     *,
     runs: int,
-    R: float,
     base_seed: int,
     norm: str,
     solver: str | None,
@@ -87,7 +85,6 @@ def empirical_worst_case_thresholds(
             solver_ftl = ExactFTLNoClip(
                 d=5,
                 T_max=T,
-                R=R,
                 norm=norm,
                 solver=solver,
                 solver_opts=solver_opts_dict,
@@ -99,14 +96,13 @@ def empirical_worst_case_thresholds(
 
             z = gen.standard_normal((T, 5)).astype(np.float64, copy=False)
             norms = np.linalg.norm(z, axis=1, keepdims=True)
-            z *= R / np.maximum(norms, 1.0)
+            z *= 1.0 / np.maximum(norms, 1.0)
 
             y = gen.choice([-1.0, 1.0], size=T).astype(np.float64, copy=False)
 
             reg = run_ftrl(
                 z,
                 y,
-                R=R,
                 eta0=math.sqrt(2),
                 norm=norm,
                 solver=solver,
@@ -149,7 +145,7 @@ def evaluate_stream_with_stats(
         position=0,
     ):
         run_seed = cfg.base_seed + 2025 * (run_idx + 1)
-        sampler = stream_builder(run_seed=run_seed, R=cfg.R)
+        sampler = stream_builder(run_seed=run_seed)
 
         for ti, T in enumerate(
             _progress(T_grid, desc="  sequence lengths", leave=False, position=1)
@@ -163,13 +159,12 @@ def evaluate_stream_with_stats(
                 y_arr = np.ascontiguousarray(y, dtype=np.float64)
                 d = z_arr.shape[1]
 
-                key = (d, T_int, cfg.R, cfg.norm, cfg.solver, solver_opts_key)
+                key = (d, T_int, cfg.norm, cfg.solver, solver_opts_key)
                 solver_ftl = solver_cache.get(key)
                 if solver_ftl is None:
                     solver_ftl = ExactFTLNoClip(
                         d=d,
                         T_max=T_int,
-                        R=cfg.R,
                         norm=cfg.norm,
                         solver=cfg.solver,
                         solver_opts=None if cfg.solver_opts is None else dict(cfg.solver_opts),
@@ -181,7 +176,6 @@ def evaluate_stream_with_stats(
                 ftrl_res = run_ftrl(
                     z_arr,
                     y_arr,
-                    R=cfg.R,
                     eta0=math.sqrt(2),
                     norm=cfg.norm,
                     comparator_action=actions[-1],
@@ -277,7 +271,6 @@ def main() -> None:
     g_emp = empirical_worst_case_thresholds(
         cfg.T_grid,
         runs=cfg.g_runs,
-        R=cfg.R,
         base_seed=cfg.base_seed,
         norm=cfg.norm,
         solver=cfg.solver,

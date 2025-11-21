@@ -10,15 +10,15 @@ from tqdm import tqdm
 def _normalized_hinge(q: float, y: float) -> float:
     return 0.5 * abs(q - y)  # y ∈ {±1}, q ∈ [-1,1]
 
-def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
+def _action_ftl(theta: np.ndarray, out: np.ndarray) -> None:
     n = np.linalg.norm(theta)
-    out[:] = 0.0 if n == 0.0 else -(R / n) * theta
+    out[:] = 0.0 if n == 0.0 else -(1.0 / n) * theta
 
-def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarray) -> None:
+def _action_ftrl(theta: np.ndarray, t: int, eta0: float, out: np.ndarray) -> None:
     out[:] = -(eta0 / math.sqrt(max(1, t))) * theta
     n = np.linalg.norm(out)
-    if n > R:
-        out *= R / n
+    if n > 1.0:
+        out *= 1.0 / n
 
 
 # ==============================================================
@@ -28,7 +28,6 @@ def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarr
 def simulate_alg(z: np.ndarray,
                  y: np.ndarray,
                  alg_flag: int,  # 0 = FTRL, 1 = FTL
-                 R: float,
                  eta0: float) -> float:
     T, d = z.shape
     theta = np.zeros(d, dtype=np.float32)
@@ -37,11 +36,11 @@ def simulate_alg(z: np.ndarray,
 
     for t in range(T):
         if alg_flag == 0:
-            _action_ftrl(theta, t + 1, R, eta0, x_t)
+            _action_ftrl(theta, t + 1, eta0, x_t)
         else:
-            _action_ftl(theta, R, x_t)
+            _action_ftl(theta, x_t)
 
-        q = np.clip(np.dot(z[t], x_t), -1.0, 1.0)
+        q = float(np.dot(z[t], x_t))
         y_t = float(y[t])
         cum_loss += _normalized_hinge(q, y_t)
 
@@ -49,8 +48,8 @@ def simulate_alg(z: np.ndarray,
         grad_q = 0.5 if diff > 0.0 else -0.5 if diff < 0.0 else 0.0
         theta += grad_q * z[t]
 
-    _action_ftl(theta, R, x_t)
-    q_all = np.clip(z @ x_t, -1.0, 1.0)
+    _action_ftl(theta, x_t)
+    q_all = z @ x_t
     comp_loss = np.sum(0.5 * np.abs(q_all - y))
     return cum_loss - comp_loss
 
@@ -66,7 +65,6 @@ def _compute_gradient(q_pred: float, y_true: float) -> float:
 def simulate_SMART_like(z: np.ndarray,
                         y: np.ndarray,
                         theta_thresh: float,
-                        R: float,
                         eta0: float) -> float:
     """
     Single-switch SMART: start with FTL, switch to FTRL when FTL's
@@ -92,42 +90,42 @@ def simulate_SMART_like(z: np.ndarray,
         yt = float(y[t])
 
         # --- Always update FTL parameters (used for switch test) ---
-        _action_ftl(theta_ftl, R, x)
-        pred_ftl = np.clip(zt @ x, -1.0, 1.0)
+        _action_ftl(theta_ftl, x)
+        pred_ftl = float(zt @ x)
         theta_ftl += _compute_gradient(pred_ftl, yt) * zt
         loss_ftl = _normalized_hinge(pred_ftl, yt)
         ftl_loss += loss_ftl
 
         # --- Play either FTL (pre-switch) or FTRL (post-switch) ---
         if switched:
-            _action_ftrl(theta_ftrl, t + 1, R, eta0, x)
-            pred = np.clip(zt @ x, -1.0, 1.0)
+            _action_ftrl(theta_ftrl, t + 1, eta0, x)
+            pred = float(zt @ x)
             total_loss += _normalized_hinge(pred, yt)
             theta_ftrl += _compute_gradient(pred, yt) * zt
         else:
             total_loss += loss_ftl
 
             # Check switch condition using best constant action so far
-            _action_ftl(theta_ftl, R, s)
-            q_hist = np.clip(z[:t+1] @ s, -1.0, 1.0)
+            _action_ftl(theta_ftl, s)
+            q_hist = z[:t+1] @ s
             s_loss = np.sum(0.5 * np.abs(q_hist - y[:t+1]))
             if ftl_loss - s_loss >= theta_thresh:
                 switched = True
 
     # Final comparator loss (with final s from FTL)
-    _action_ftl(theta_ftl, R, s)
-    q_all = np.clip(z @ s, -1.0, 1.0)
+    _action_ftl(theta_ftl, s)
+    q_all = z @ s
     comp_loss = np.sum(0.5 * np.abs(q_all - y))
 
     return total_loss - comp_loss
 
 
-def simulate_SMART(z: np.ndarray, y: np.ndarray, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
+def simulate_SMART(z: np.ndarray, y: np.ndarray, *, eta0: float = math.sqrt(2)) -> float:
     T = z.shape[0]
-    return simulate_SMART_like(z, y, theta_thresh=math.sqrt(2*T), R=R, eta0=eta0)
+    return simulate_SMART_like(z, y, theta_thresh=math.sqrt(2*T), eta0=eta0)
 
-def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, theta_emp: float, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
-    return simulate_SMART_like(z, y, theta_thresh=theta_emp, R=R, eta0=eta0)
+def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, theta_emp: float, *, eta0: float = math.sqrt(2)) -> float:
+    return simulate_SMART_like(z, y, theta_thresh=theta_emp, eta0=eta0)
 
 
 # ==============================================================
@@ -138,7 +136,6 @@ def empirical_worst_case_thresholds(
     T_grid: np.ndarray,
     *,
     runs: int = 5,
-    R: float = 1.0,
     base_seed: int = 0,
 ) -> Dict[int, float]:
     """
@@ -157,15 +154,15 @@ def empirical_worst_case_thresholds(
         for r in range(runs):
             gen = _rng(base_seed, T, r)
 
-            # z: rows clipped to norm ≤ R
+            # z: rows clipped to unit norm
             z = gen.standard_normal((T, 5)).astype(np.float32, copy=False)
             norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32, copy=False)
-            z *= (R / np.maximum(norms, 1.0))
+            z *= (1.0 / np.maximum(norms, 1.0))
 
             # labels y ∈ {−1, +1}
             y = gen.choice([-1.0, 1.0], size=T).astype(np.float32, copy=False)
 
-            reg = simulate_alg(z, y, alg_flag=0, R=R, eta0=math.sqrt(2))
+            reg = simulate_alg(z, y, alg_flag=0, eta0=math.sqrt(2))
             if reg > max_regret:
                 max_regret = reg
 

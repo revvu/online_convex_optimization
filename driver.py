@@ -46,7 +46,6 @@ CI_Z = 1.96  # 95% normal CI
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    R: float = 1.0
     T_grid: IntArray = np.arange(100, 1100, 100, dtype=int)
     base_seed: int = 0
     g_runs: int = 1000  # runs for empirical g(T) estimation
@@ -75,7 +74,6 @@ def evaluate_stream_with_stats(
     *,
     runs: int = 1,
     replicates: int = 1,
-    R: float = 1.0,
     base_seed: int = 0,
     stream_name: str = "",
 ) -> Stats:
@@ -88,7 +86,7 @@ def evaluate_stream_with_stats(
 
     for run in _progress(range(runs), desc=f"{stream_name:>24} | runs={runs}, reps/T={replicates}", position=0):
         run_seed = base_seed + 2025 * (run + 1)
-        sampler = stream_builder(run_seed=run_seed, R=R)
+        sampler = stream_builder(run_seed=run_seed)
 
         for ti, T in enumerate(_progress(T_grid, desc="  sequence lengths", leave=False, position=1)):
             rep_vals = {k: [] for k in ALGO_KEYS}
@@ -101,16 +99,16 @@ def evaluate_stream_with_stats(
 
                 # Keep the simulation calls visually aligned for quick scan
                 rep_vals["FTRL"].append(
-                    simulate_alg(z, y, alg_flag=0, R=R, eta0=math.sqrt(2))
+                    simulate_alg(z, y, alg_flag=0, eta0=math.sqrt(2))
                 )
                 rep_vals["FTL"].append(
-                    simulate_alg(z, y, alg_flag=1, R=R, eta0=math.sqrt(2))
+                    simulate_alg(z, y, alg_flag=1, eta0=math.sqrt(2))
                 )
                 rep_vals["SMART"].append(
-                    simulate_SMART(z, y, R=R)
+                    simulate_SMART(z, y)
                 )
                 rep_vals["EMP"].append(
-                    simulate_empirical_g_SMART(z, y, theta_emp, R=R)
+                    simulate_empirical_g_SMART(z, y, theta_emp)
                 )
 
             for k in ALGO_KEYS:
@@ -207,7 +205,7 @@ def main() -> None:
     cfg = ExperimentConfig()
 
     # 1) Empirical g(T) from near-minimax adversarial families (ALG_WC = FTRL)
-    g_emp = empirical_worst_case_thresholds(cfg.T_grid, runs=cfg.g_runs, R=cfg.R)
+    g_emp = empirical_worst_case_thresholds(cfg.T_grid, runs=cfg.g_runs)
 
     # 2) Plot empirical g(T) vs references
     plot_empirical_g(cfg.T_grid, g_emp, out_path="empirical_g_T.png")
@@ -221,7 +219,6 @@ def main() -> None:
             g_emp,
             runs=RUNS_BY_TITLE.get(title, 1),
             replicates=REPLICATES_BY_TITLE.get(title, 1),
-            R=cfg.R,
             base_seed=cfg.base_seed,
             stream_name=title,
         )

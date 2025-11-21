@@ -17,15 +17,6 @@ def _dot(a: np.ndarray, b: np.ndarray) -> float:
 
 
 @njit(cache=True)
-def _clip_unit_interval(value: float) -> float:
-    if value < -1.0:
-        return -1.0
-    if value > 1.0:
-        return 1.0
-    return value
-
-
-@njit(cache=True)
 def _normalized_hinge(q: float, y: float) -> float:
     diff = q - y
     if diff < 0.0:
@@ -44,7 +35,7 @@ def _compute_gradient(q_pred: float, y_true: float) -> float:
 
 
 @njit(cache=True)
-def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
+def _action_ftl(theta: np.ndarray, out: np.ndarray) -> None:
     norm_sq = 0.0
     d = theta.shape[0]
     for j in range(d):
@@ -53,13 +44,13 @@ def _action_ftl(theta: np.ndarray, R: float, out: np.ndarray) -> None:
         for j in range(d):
             out[j] = 0.0
         return
-    scale = -(R / math.sqrt(norm_sq))
+    scale = -(1.0 / math.sqrt(norm_sq))
     for j in range(d):
         out[j] = scale * theta[j]
 
 
 @njit(cache=True)
-def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarray) -> None:
+def _action_ftrl(theta: np.ndarray, t: int, eta0: float, out: np.ndarray) -> None:
     d = theta.shape[0]
     scale = -(eta0 / math.sqrt(max(1, t)))
     for j in range(d):
@@ -67,10 +58,10 @@ def _action_ftrl(theta: np.ndarray, t: int, R: float, eta0: float, out: np.ndarr
     norm_sq = 0.0
     for j in range(d):
         norm_sq += out[j] * out[j]
-    if norm_sq <= R * R:
+    if norm_sq <= 1.0:
         return
     norm = math.sqrt(norm_sq)
-    factor = R / norm
+    factor = 1.0 / norm
     for j in range(d):
         out[j] *= factor
 
@@ -80,7 +71,7 @@ def _total_comparator_loss(z: np.ndarray, y: np.ndarray, action: np.ndarray) -> 
     total = 0.0
     T = z.shape[0]
     for i in range(T):
-        pred = _clip_unit_interval(_dot(z[i], action))
+        pred = _dot(z[i], action)
         total += _normalized_hinge(pred, y[i])
     return total
 
@@ -89,7 +80,7 @@ def _total_comparator_loss(z: np.ndarray, y: np.ndarray, action: np.ndarray) -> 
 def _comparator_loss_prefix(z: np.ndarray, y: np.ndarray, action: np.ndarray, length: int) -> float:
     total = 0.0
     for i in range(length):
-        pred = _clip_unit_interval(_dot(z[i], action))
+        pred = _dot(z[i], action)
         total += _normalized_hinge(pred, y[i])
     return total
 
@@ -98,7 +89,6 @@ def _comparator_loss_prefix(z: np.ndarray, y: np.ndarray, action: np.ndarray, le
 def _simulate_alg_core(z: np.ndarray,
                        y: np.ndarray,
                        alg_flag: int,
-                       R: float,
                        eta0: float) -> float:
     T = z.shape[0]
     d = z.shape[1]
@@ -108,11 +98,11 @@ def _simulate_alg_core(z: np.ndarray,
 
     for t in range(T):
         if alg_flag == 0:
-            _action_ftrl(theta, t + 1, R, eta0, x_t)
+            _action_ftrl(theta, t + 1, eta0, x_t)
         else:
-            _action_ftl(theta, R, x_t)
+            _action_ftl(theta, x_t)
 
-        q = _clip_unit_interval(_dot(z[t], x_t))
+        q = _dot(z[t], x_t)
         y_t = y[t]
         cum_loss += _normalized_hinge(q, y_t)
 
@@ -120,7 +110,7 @@ def _simulate_alg_core(z: np.ndarray,
         for j in range(d):
             theta[j] += grad_q * z[t, j]
 
-    _action_ftl(theta, R, x_t)
+    _action_ftl(theta, x_t)
     comp_loss = _total_comparator_loss(z, y, x_t)
     return cum_loss - comp_loss
 
@@ -129,7 +119,6 @@ def _simulate_alg_core(z: np.ndarray,
 def _simulate_SMART_like_core(z: np.ndarray,
                               y: np.ndarray,
                               theta_thresh: float,
-                              R: float,
                               eta0: float) -> float:
     T = z.shape[0]
     d = z.shape[1]
@@ -148,8 +137,8 @@ def _simulate_SMART_like_core(z: np.ndarray,
         zt = z[t]
         yt = y[t]
 
-        _action_ftl(theta_ftl, R, x)
-        pred_ftl = _clip_unit_interval(_dot(zt, x))
+        _action_ftl(theta_ftl, x)
+        pred_ftl = _dot(zt, x)
         grad_ftl = _compute_gradient(pred_ftl, yt)
         for j in range(d):
             theta_ftl[j] += grad_ftl * zt[j]
@@ -157,20 +146,20 @@ def _simulate_SMART_like_core(z: np.ndarray,
         ftl_loss += loss_ftl
 
         if switched:
-            _action_ftrl(theta_ftrl, t + 1, R, eta0, x)
-            pred = _clip_unit_interval(_dot(zt, x))
+            _action_ftrl(theta_ftrl, t + 1, eta0, x)
+            pred = _dot(zt, x)
             total_loss += _normalized_hinge(pred, yt)
             grad = _compute_gradient(pred, yt)
             for j in range(d):
                 theta_ftrl[j] += grad * zt[j]
         else:
             total_loss += loss_ftl
-            _action_ftl(theta_ftl, R, s)
+            _action_ftl(theta_ftl, s)
             s_loss = _comparator_loss_prefix(z, y, s, t + 1)
             if ftl_loss - s_loss >= theta_thresh:
                 switched = True
 
-    _action_ftl(theta_ftl, R, s)
+    _action_ftl(theta_ftl, s)
     comp_loss = _total_comparator_loss(z, y, s)
     return total_loss - comp_loss
 
@@ -182,11 +171,10 @@ def _simulate_SMART_like_core(z: np.ndarray,
 def simulate_alg(z: np.ndarray,
                  y: np.ndarray,
                  alg_flag: int,
-                 R: float,
                  eta0: float) -> float:
     z_arr = np.ascontiguousarray(z, dtype=np.float64)
     y_arr = np.ascontiguousarray(y, dtype=np.float64)
-    return float(_simulate_alg_core(z_arr, y_arr, int(alg_flag), float(R), float(eta0)))
+    return float(_simulate_alg_core(z_arr, y_arr, int(alg_flag), float(eta0)))
 
 
 # ==============================================================
@@ -196,7 +184,6 @@ def simulate_alg(z: np.ndarray,
 def simulate_SMART_like(z: np.ndarray,
                         y: np.ndarray,
                         theta_thresh: float,
-                        R: float,
                         eta0: float) -> float:
     """
     Single-switch SMART: start with FTL, switch to FTRL when FTL's
@@ -205,16 +192,16 @@ def simulate_SMART_like(z: np.ndarray,
     """
     z_arr = np.ascontiguousarray(z, dtype=np.float64)
     y_arr = np.ascontiguousarray(y, dtype=np.float64)
-    return float(_simulate_SMART_like_core(z_arr, y_arr, float(theta_thresh), float(R), float(eta0)))
+    return float(_simulate_SMART_like_core(z_arr, y_arr, float(theta_thresh), float(eta0)))
 
 
-def simulate_SMART(z: np.ndarray, y: np.ndarray, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
+def simulate_SMART(z: np.ndarray, y: np.ndarray, *, eta0: float = math.sqrt(2)) -> float:
     T = z.shape[0]
-    return simulate_SMART_like(z, y, theta_thresh=math.sqrt(2 * T), R=R, eta0=eta0)
+    return simulate_SMART_like(z, y, theta_thresh=math.sqrt(2 * T), eta0=eta0)
 
 
-def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, theta_emp: float, *, R: float = 1.0, eta0: float = math.sqrt(2)) -> float:
-    return simulate_SMART_like(z, y, theta_thresh=theta_emp, R=R, eta0=eta0)
+def simulate_empirical_g_SMART(z: np.ndarray, y: np.ndarray, theta_emp: float, *, eta0: float = math.sqrt(2)) -> float:
+    return simulate_SMART_like(z, y, theta_thresh=theta_emp, eta0=eta0)
 
 
 # ==============================================================
@@ -225,7 +212,6 @@ def empirical_worst_case_thresholds(
     T_grid: np.ndarray,
     *,
     runs: int = 5,
-    R: float = 1.0,
     base_seed: int = 0,
 ) -> Dict[int, float]:
     """
@@ -244,15 +230,15 @@ def empirical_worst_case_thresholds(
         for r in range(runs):
             gen = _rng(base_seed, T, r)
 
-            # z: rows clipped to norm ≤ R
+            # z: rows clipped to unit norm
             z = gen.standard_normal((T, 5)).astype(np.float64, copy=False)
             norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float64, copy=False)
-            z *= (R / np.maximum(norms, 1.0))
+            z *= (1.0 / np.maximum(norms, 1.0))
 
             # labels y ∈ {−1, +1}
             y = gen.choice([-1.0, 1.0], size=T).astype(np.float64, copy=False)
 
-            reg = simulate_alg(z, y, alg_flag=0, R=R, eta0=math.sqrt(2))
+            reg = simulate_alg(z, y, alg_flag=0, eta0=math.sqrt(2))
             if reg > max_regret:
                 max_regret = reg
 

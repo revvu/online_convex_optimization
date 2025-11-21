@@ -21,8 +21,8 @@ from algorithms import _rng
 # Adversarial families used for g(T)
 # ==============================================================
 
-def flip_sequence(T: int, d: int = 5, R: float = 1.0):
-    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
+def flip_sequence(T: int, d: int = 5):
+    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = 1.0
     y = np.array([1.0 if t % 2 else -1.0 for t in range(1, T + 1)], dtype=np.float32)
     u = np.zeros(d, dtype=np.float32)
     return z, y, u
@@ -33,7 +33,7 @@ def flip_sequence(T: int, d: int = 5, R: float = 1.0):
 #   No growing lead; tests adaptation to leader switches without contrived drift.
 # ==============================================================
 
-def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5, R: float = 1.0):
+def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5):
     y = np.empty(T, dtype=np.float32)
     sign = 1.0
     idx = 0
@@ -42,7 +42,7 @@ def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5, R
         y[idx:idx+run] = sign
         idx += run
         sign = -sign
-    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = R
+    z = np.zeros((T, d), dtype=np.float32); z[:, 0] = 1.0
     u = np.zeros(d, dtype=np.float32)
     return z, y, u
 
@@ -51,7 +51,7 @@ def switching_two_leaders_sequence(T: int, *, block_len: int = 20, d: int = 5, R
 # Stream builders (fixed task per run; fresh sequences per T; replicates)
 # ==============================================================
 
-def make_random_iid_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
+def make_random_iid_stream(*, d: int = 5, run_seed: int = 0):
     gen_u = _rng(run_seed, 0, 11)
     u = gen_u.standard_normal(d).astype(np.float32, copy=False)
     n = float(np.linalg.norm(u))
@@ -63,13 +63,13 @@ def make_random_iid_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
         z = gen.standard_normal((T, d)).astype(np.float32, copy=False)
         norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32, copy=False)
         np.maximum(norms, 1.0, out=norms)
-        z *= (R / norms)
+        z *= (1.0 / norms)
         y = np.sign(z @ u).astype(np.float32, copy=False)
         y[y == 0.0] = 1.0
         return z, y, u
     return sample
 
-def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int = 0):
+def make_noisy_iid_stream(*, p: float, d: int = 5, run_seed: int = 0):
     gen_u = _rng(run_seed, 0, 21)
     u = gen_u.standard_normal(d).astype(np.float32, copy=False)
     n = float(np.linalg.norm(u))
@@ -81,7 +81,7 @@ def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int
         z = gen.standard_normal((T, d)).astype(np.float32, copy=False)
         norms = np.linalg.norm(z, axis=1, keepdims=True).astype(np.float32, copy=False)
         np.maximum(norms, 1.0, out=norms)
-        z *= (R / norms)
+        z *= (1.0 / norms)
         y = np.sign(z @ u).astype(np.float32, copy=False)
         y[y == 0.0] = 1.0
         flips = gen.random(T) < p
@@ -89,35 +89,35 @@ def make_noisy_iid_stream(*, p: float, d: int = 5, R: float = 1.0, run_seed: int
         return z, y, u
     return sample
 
-def make_flip_stream(*, d: int = 5, R: float = 1.0, run_seed: int = 0):
+def make_flip_stream(*, d: int = 5, run_seed: int = 0):
     def sample(T: int, rep: int = 0):
-        return flip_sequence(T, d=d, R=R)
+        return flip_sequence(T, d=d)
     return sample
 
-def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 5, R: float = 1.0, run_seed: int = 0):
+def make_switching_two_leaders_stream(*, block_len: int = 20, d: int = 5, run_seed: int = 0):
     def sample(T: int, rep: int = 0):
-        return switching_two_leaders_sequence(T, block_len=block_len, d=d, R=R)
+        return switching_two_leaders_sequence(T, block_len=block_len, d=d)
     return sample
 
 
 # --- CASE SET (builders) ---
 CASES: Dict[str, Callable[..., Callable[[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]]] = {
-    "Random i.i.d. (separable)":              lambda *, run_seed, R: make_random_iid_stream(d=5, R=R, run_seed=run_seed),
-    "Massart noise 10%":             lambda *, run_seed, R: make_noisy_iid_stream(p=0.10, d=5, R=R, run_seed=run_seed),
-    "Label flips":               lambda *, run_seed, R: make_flip_stream(d=5, R=R, run_seed=run_seed),
-    "Switching leaders":      lambda *, run_seed, R: make_switching_two_leaders_stream(block_len=20, d=5, R=R, run_seed=run_seed),
+    "Random i.i.d. (separable)":              lambda *, run_seed: make_random_iid_stream(d=5, run_seed=run_seed),
+    "Massart noise 10%":             lambda *, run_seed: make_noisy_iid_stream(p=0.10, d=5, run_seed=run_seed),
+    "Label flips":               lambda *, run_seed: make_flip_stream(d=5, run_seed=run_seed),
+    "Switching leaders":      lambda *, run_seed: make_switching_two_leaders_stream(block_len=20, d=5, run_seed=run_seed),
 }
 
 # Case-specific averaging controls
 RUNS_BY_TITLE = {
-    "Random i.i.d. (separable)":              8,
-    "Massart noise 10%":             8,
+    "Random i.i.d. (separable)":              48,
+    "Massart noise 10%":             48,
     "Label flips":                1,
     "Switching leaders":       1,   # deterministic
 }
 REPLICATES_BY_TITLE = {
-    "Random i.i.d. (separable)":              2,
-    "Massart noise 10%":             2,
+    "Random i.i.d. (separable)":              16,
+    "Massart noise 10%":             20,
     "Label flips":                1,
     "Switching leaders":       1,
 }
