@@ -47,7 +47,7 @@ class ExperimentConfig:
     norm: str = "l2"
     solver: str | None = None
     solver_opts: Mapping[str, object] | None = None
-    reuse_grid: Sequence[int] = (1, 5, 10)
+    reuse_grid: Sequence[int] = (1,)
 
 
 def _progress(iterable: Iterable, **kwargs):
@@ -130,11 +130,8 @@ def evaluate_stream_with_stats(
     cfg: ExperimentConfig,
     stream_name: str,
 ) -> Stats:
-    ftl_labels = {
-        reuse: ("FTL (exact)" if reuse == 1 else f"FTL (exact, reuse={reuse})")
-        for reuse in cfg.reuse_grid
-    }
-    algo_labels = ["FTRL", *[ftl_labels[reuse] for reuse in cfg.reuse_grid]]
+    ftl_labels = {1: "FTL (exact)"}
+    algo_labels = ["FTRL", "FTL (exact)"]
     by_T: Dict[str, list[list[float]]] = {
         label: [[] for _ in range(len(T_grid))]
         for label in algo_labels
@@ -191,15 +188,12 @@ def evaluate_stream_with_stats(
                 )
                 rep_vals["FTRL"].append(float(ftrl_res.regret))
 
-                for reuse in cfg.reuse_grid:
-                    label = ftl_labels[reuse]
-                    res_ftl = replay_exact_ftl(
-                        z_arr,
-                        y_arr,
-                        actions,
-                        reuse_every_k=reuse,
-                    )
-                    rep_vals[label].append(float(res_ftl.regret))
+                res_ftl = replay_exact_ftl(
+                    z_arr,
+                    y_arr,
+                    actions,
+                )
+                rep_vals["FTL (exact)"].append(float(res_ftl.regret))
 
             for label in algo_labels:
                 by_T[label][ti].append(float(np.mean(rep_vals[label])))

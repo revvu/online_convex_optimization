@@ -28,6 +28,14 @@ def _normalized_hinge(q: float, y: float) -> float:
     return 0.5 * diff
 
 @njit(cache=True)
+def _clip_unit_interval(value: float) -> float:
+    if value < -1.0:
+        return -1.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+@njit(cache=True)
 def _grad_normalized_hinge(q: float, y: float) -> float:
     diff = q - y
     if diff > 0.0:
@@ -60,8 +68,8 @@ def _ensure_float64_contiguous(arr: np.ndarray) -> np.ndarray:
 
 class ExactFTLNoClip:
     """
-    Build once, solve many: exact FTL (no clip) with a norm-ball constraint.
-    We use a mask w \in {0,1}^Tmax in the objective to include only the prefix.
+    Build once, solve many: exact FTL with a norm-ball constraint and
+    clipped predictions (u ∈ [-1, 1]). Mask w \in {0,1}^Tmax selects the prefix.
     """
     def __init__(
         self,
@@ -87,11 +95,18 @@ class ExactFTLNoClip:
 
         # Variables
         self.x = cp.Variable(self.d)
+        u = cp.Variable(self.T_max)
         s = cp.Variable(self.T_max, nonneg=True)
 
-        # Residuals for all rows; we weight only the active prefix via w in the objective
-        r = self.Z @ self.x - self.y
-        cons = [s >= r, s >= -r]
+        # u stores clipped predictions; r stores residuals vs labels
+        r = u - self.y
+        cons = [
+            u == self.Z @ self.x,
+            u >= -1,
+            u <= 1,
+            s >= r,
+            s >= -r,
+        ]
 
         if self.norm == "l2":
             cons += [cp.norm2(self.x) <= self.R]    # SOCP
@@ -201,11 +216,14 @@ class RunResult:
     comp_loss: float
     x_last: np.ndarray
 
-def _comparator_loss_no_clip(z: np.ndarray, y: np.ndarray, x: np.ndarray) -> float:
+def _comparator_loss_clipped(z: np.ndarray, y: np.ndarray, x: np.ndarray) -> float:
     """
-    0.5 * sum |z x - y|; training/reporting is no-clip by user instruction.
+    0.5 * sum |clip(z x) - y|; matches clipped-loss reporting used elsewhere.
     """
-    r = z @ x - y
+    r = z @ x
+    # Clip predictions to keep regret comparable to other drivers
+    np.clip(r, -1.0, 1.0, out=r)
+    r -= y
     return 0.5 * float(np.abs(r).sum())
 
 
@@ -229,6 +247,7 @@ def _simulate_ftrl(
     for t in range(T):
         _action_ftrl(theta, t + 1, R, eta0, x_t)
         q = _dot(z_arr[t], x_t)
+        q = _clip_unit_interval(q)
         y_t = y_arr[t]
         cum_loss += _normalized_hinge(q, y_t)
 
@@ -250,7 +269,7 @@ def _simulate_ftrl(
     else:
         comp_vec = _ensure_float64_contiguous(comparator_action)
 
-    comp_loss = _comparator_loss_no_clip(z_arr, y_arr, comp_vec)
+    comp_loss = _comparator_loss_clipped(z_arr, y_arr, comp_vec)
     regret = cum_loss - comp_loss
 
     return RunResult(
@@ -290,38 +309,30 @@ def replay_exact_ftl(
     z: np.ndarray,
     y: np.ndarray,
     actions: np.ndarray,
-    *,
-    reuse_every_k: int,
 ) -> RunResult:
-    if reuse_every_k <= 0:
-        raise ValueError("reuse_every_k must be ≥ 1")
-
     z_arr = _ensure_float64_contiguous(z)
     y_arr = _ensure_float64_contiguous(y)
     T, d = z_arr.shape
-
     if actions.shape != (T + 1, d):
         raise ValueError("actions must have shape (T+1, d)")
 
-    last_len = 0
     cum_loss = 0.0
 
     for t in range(T):
-        if t > 0 and (t % reuse_every_k == 0):
-            last_len = t
-        x_t = actions[last_len]
+        x_t = actions[t]
         q = _dot(z_arr[t], x_t)
+        q = _clip_unit_interval(q)
         cum_loss += _normalized_hinge(q, y_arr[t])
 
     comp_action = actions[T]
-    comp_loss = _comparator_loss_no_clip(z_arr, y_arr, comp_action)
+    comp_loss = _comparator_loss_clipped(z_arr, y_arr, comp_action)
     regret = cum_loss - comp_loss
 
     return RunResult(
         cum_loss=float(cum_loss),
         regret=float(regret),
         comp_loss=float(comp_loss),
-        x_last=actions[last_len].copy(),
+        x_last=actions[T].copy(),
     )
 
 
@@ -335,7 +346,6 @@ def simulate(
     norm: Literal["l2", "linf", "l1"] = "l2",
     solver: Optional[str] = None,
     solver_opts: Optional[dict] = None,
-    reuse_every_k: int = 1,
     ftl_solver: Optional[ExactFTLNoClip] = None,
     comparator_solver: Optional[ExactFTLNoClip] = None,
     prefix_actions: Optional[np.ndarray] = None,
@@ -360,7 +370,7 @@ def simulate(
         actions = prefix_actions
         if actions is None:
             actions = compute_prefix_actions(solver_obj, z_arr, y_arr)
-        return replay_exact_ftl(z_arr, y_arr, actions, reuse_every_k=reuse_every_k)
+        return replay_exact_ftl(z_arr, y_arr, actions)
 
     if algo == "ftrl":
         solver_for_comp = comparator_solver
@@ -427,7 +437,6 @@ def run_ftl_exact(
     norm: Literal["l2", "linf", "l1"] = "l2",
     solver: Optional[str] = None,
     solver_opts: Optional[dict] = None,
-    reuse_every_k: int = 1,
     ftl_solver: Optional[ExactFTLNoClip] = None,
     prefix_actions: Optional[np.ndarray] = None,
     return_actions: bool = False,
@@ -448,7 +457,7 @@ def run_ftl_exact(
         )
 
     actions = prefix_actions if prefix_actions is not None else compute_prefix_actions(solver_obj, z_arr, y_arr)
-    result = replay_exact_ftl(z_arr, y_arr, actions, reuse_every_k=reuse_every_k)
+    result = replay_exact_ftl(z_arr, y_arr, actions)
 
     if return_actions:
         return result, actions
@@ -470,8 +479,8 @@ if __name__ == "__main__":
 
     R = 1.0
 
-    print("FTL exact (l2, reuse_every_k=5)...")
-    res_ftl = run_ftl_exact(z, y, R=R, norm="l2", solver="ECOS", reuse_every_k=5)
+    print("FTL exact (l2)...")
+    res_ftl = run_ftl_exact(z, y, R=R, norm="l2", solver="ECOS")
     print(f"cum_loss={res_ftl.cum_loss:.4f}  regret={res_ftl.regret:.4f}  comp={res_ftl.comp_loss:.4f}")
 
     print("FTRL baseline...")
