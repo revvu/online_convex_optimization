@@ -134,7 +134,7 @@ def evaluate_stream_with_stats(
     }
 
     solver_cache: Dict[
-        Tuple[int, int, float, str | None, str | None, Tuple[Tuple[str, object], ...] | None],
+        Tuple[int, int, str | None, str | None, Tuple[Tuple[str, object], ...] | None],
         ExactFTLNoClip,
     ] = {}
     solver_opts_key = None if cfg.solver_opts is None else tuple(sorted(cfg.solver_opts.items()))

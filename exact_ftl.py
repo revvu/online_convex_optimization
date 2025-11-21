@@ -118,14 +118,35 @@ class ExactFTLNoClip:
 
     def _solve_current(self) -> np.ndarray:
         if self.solver is None:
-            self._prob.solve(warm_start=True)
+            self._prob.solve(warm_start=True, verbose=False)
         else:
-            self._prob.solve(solver=self.solver, warm_start=True, **self.solver_opts)
+            self._prob.solve(solver=self.solver, warm_start=True, verbose=False, **self.solver_opts)
 
         if self._prob.status not in ("optimal", "optimal_inaccurate"):
             raise RuntimeError(f"Exact FTL (no clip) failed: status={self._prob.status}")
 
         return np.asarray(self.x.value, dtype=np.float64)
+
+    def reset_buffers(self) -> None:
+        """Reset cached data for a new sequence."""
+        self._Z_buf.fill(0.0)
+        self._y_buf.fill(0.0)
+        self._w_buf.fill(0.0)
+        self._last_length = 0
+        self.Z.value = self._Z_buf
+        self.y.value = self._y_buf
+        self.w.value = self._w_buf
+
+    def append_row(self, z_row: np.ndarray, y_val: float) -> np.ndarray:
+        """Append a single example to the cached sequence and solve."""
+        if self._last_length >= self.T_max:
+            raise ValueError("sequence longer than T_max")
+        idx = self._last_length
+        self._Z_buf[idx] = z_row
+        self._y_buf[idx] = y_val
+        self._w_buf[idx] = 1.0
+        self._last_length += 1
+        return self._solve_current()
 
     def _set_prefix(self, z_source: np.ndarray, y_source: np.ndarray, length: int) -> None:
         t = int(length)
@@ -275,8 +296,9 @@ def compute_prefix_actions(
     if d > 0:
         actions[0].fill(0.0)
 
-    for length in range(1, T + 1):
-        actions[length] = solver.solve_prefix_from_full(z_arr, y_arr, length)
+    solver.reset_buffers()
+    for idx in range(T):
+        actions[idx + 1] = solver.append_row(z_arr[idx], float(y_arr[idx]))
 
     return actions
 
